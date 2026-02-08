@@ -1,0 +1,17 @@
+# Large media files
+*.mp4
+*.mov
+*.mp3
+*.env
+
+# Logs
+*.log
+*.out
+
+# Clawblox
+.clawblox/
+.clawblox.log
+
+# Duplicate/generated models
+my-game/models/
+my-game/static/models/

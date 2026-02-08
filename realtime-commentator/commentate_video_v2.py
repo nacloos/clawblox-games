@@ -1,16 +1,14 @@
-"""Generate commentary audio synced with gameplay video (v2).
+"""Generate commentary videos (v2).
 
-Parses timestamped commentary from tsunami/grok1.txt and transition/commentary.txt,
-generates TTS audio for each segment via ElevenLabs, trims and concatenates the
-tsunami and transition videos, then overlays the commentary track.
+Produces two separate outputs:
+  1. tsunami/tsunami_commentary.mp4 — full tsunami video + grok1.txt TTS
+  2. transition/final_commentary.mp4 — final.mov (muted) + transition TTS
 """
 
-import argparse
 import json
 import os
 import re
 import subprocess
-import tempfile
 import time
 from pathlib import Path
 
@@ -24,17 +22,16 @@ load_dotenv()
 TSUNAMI_COMMENTARY = Path("tsunami/grok1.txt")
 TSUNAMI_VIDEO = Path("tsunami/tsunami.mp4")
 TSUNAMI_CLIPS_DIR = Path("tsunami/clips")
-TSUNAMI_CUT_S = 550  # Cut tsunami at ~9:10
+TSUNAMI_TRACK = Path("tsunami/commentary_track.mp3")
+TSUNAMI_OUTPUT = Path("tsunami/tsunami_commentary.mp4")
+TSUNAMI_SEGMENTS = Path("tsunami/segments.json")
 
 # Transition to Scuttle
 TRANSITION_COMMENTARY = Path("transition/commentary.txt")
 TRANSITION_VIDEO = Path("transition/final.mov")
 TRANSITION_CLIPS_DIR = Path("transition/clips")
-
-# Output
-SEGMENTS_JSON = Path("tsunami/segments.json")
-COMMENTARY_TRACK = Path("tsunami/commentary_track.mp3")
-OUTPUT_VIDEO = Path("tsunami/tsunami_commentary.mp4")
+TRANSITION_TRACK = Path("transition/commentary_track.mp3")
+TRANSITION_OUTPUT = Path("transition/final_commentary.mp4")
 
 VOICE_ID = "oubi7HGxNVjXMnWLgwBT"
 MODEL_ID = "eleven_multilingual_v2"
@@ -144,39 +141,9 @@ def get_video_duration_ms(video_path: Path) -> int:
     return int(float(result.stdout.strip()) * 1000)
 
 
-def trim_video(input_path: Path, output_path: Path, end_s: float):
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", str(input_path),
-        "-t", str(end_s),
-        "-c", "copy",
-        str(output_path),
-    ]
-    print(f"  Trimming {input_path.name} to {end_s}s -> {output_path.name}")
-    subprocess.run(cmd, capture_output=True, check=True)
-
-
-def concat_videos(video_paths: list[Path], output_path: Path):
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
-        for p in video_paths:
-            f.write(f"file '{p.resolve()}'\n")
-        concat_list = f.name
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "concat", "-safe", "0",
-        "-i", concat_list,
-        "-c", "copy",
-        str(output_path),
-    ]
-    print(f"  Concatenating {len(video_paths)} videos -> {output_path.name}")
-    subprocess.run(cmd, capture_output=True, check=True)
-    os.unlink(concat_list)
-
-
 # -- Step 4: Assemble commentary audio track ------------------------------------
 
-def assemble_track(clips: list[tuple[int, Path]], duration_ms: int) -> Path:
+def assemble_track(clips: list[tuple[int, Path]], duration_ms: int, track_path: Path) -> Path:
     track = AudioSegment.silent(duration=duration_ms)
 
     rows = []
@@ -207,20 +174,21 @@ def assemble_track(clips: list[tuple[int, Path]], duration_ms: int) -> Path:
             diff_str = f"{diff:.1f}s"
         print(f"  {idx:>3}  {ts:>5}s  {clip_dur:>5.1f}s  {gap:>5.0f}s  {diff_str}")
 
-    track.export(str(COMMENTARY_TRACK), format="mp3")
-    print(f"\n  Exported: {COMMENTARY_TRACK}")
-    return COMMENTARY_TRACK
+    track.export(str(track_path), format="mp3")
+    print(f"\n  Exported: {track_path}")
+    return track_path
 
 
 # -- Step 5: Mux onto video ----------------------------------------------------
 
-def mux_video(video_path: Path, commentary_path: Path, output_path: Path):
+def mux_video(video_path: Path, commentary_path: Path, output_path: Path, game_audio_vol: float = 0.3):
+    """Combine video with game audio (at game_audio_vol) + commentary. Set game_audio_vol=0 to mute original."""
     cmd = [
         "ffmpeg", "-y",
         "-i", str(video_path),
         "-i", str(commentary_path),
         "-filter_complex",
-        "[0:a]volume=0.3[g];[g][1:a]amix=inputs=2:duration=first:normalize=0[out]",
+        f"[0:a]volume={game_audio_vol}[g];[g][1:a]amix=inputs=2:duration=first:normalize=0[out]",
         "-map", "0:v",
         "-map", "[out]",
         "-c:v", "copy",
@@ -228,101 +196,73 @@ def mux_video(video_path: Path, commentary_path: Path, output_path: Path):
         "-b:a", "192k",
         str(output_path),
     ]
-    print(f"  Running: {' '.join(cmd)}")
+    print(f"  Running ffmpeg mux -> {output_path}")
     subprocess.run(cmd, check=True)
     print(f"  Output: {output_path}")
 
 
 # -- Main ----------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(description="Generate commentary video v2")
-    parser.add_argument(
-        "-t", "--time", type=int, default=None,
-        help="Only process segments up to this many seconds",
-    )
-    args = parser.parse_args()
+def process_video(label, segments, clips_dir, clip_prefix, video_path, track_path, output_path, game_audio_vol=0.3):
+    """Process a single video: generate TTS, assemble track, mux."""
+    print(f"\n{'='*60}")
+    print(f"  {label}")
+    print(f"{'='*60}")
 
-    # -- Step 1: Parse both commentary files --
-    print("Step 1: Parsing commentary...")
-    tsunami_segments = parse_commentary(TSUNAMI_COMMENTARY)
-    if args.time is not None:
-        tsunami_segments = [(ts, text) for ts, text in tsunami_segments if ts <= args.time]
-        print(f"  Filtered tsunami segments <= {args.time}s")
-
-    transition_segments = parse_commentary(TRANSITION_COMMENTARY)
-
-    # Offset transition timestamps by the tsunami cut point
-    transition_offset = TSUNAMI_CUT_S
-    all_segments = list(tsunami_segments)
-    for ts, text in transition_segments:
-        all_segments.append((ts + transition_offset, text))
-
-    print(f"  Tsunami: {len(tsunami_segments)} segments")
-    print(f"  Transition: {len(transition_segments)} segments (offset +{transition_offset}s)")
-    print(f"  Total: {len(all_segments)} segments")
-    for ts, text in all_segments:
+    print(f"\n  Parsing: {len(segments)} segments")
+    for ts, text in segments:
         print(f"    {ts:>4}s: {text[:70]}...")
 
-    SEGMENTS_JSON.write_text(json.dumps(
+    print(f"\n  Generating TTS clips...")
+    clips = generate_clips(segments, clips_dir, clip_prefix)
+
+    duration_ms = get_video_duration_ms(video_path)
+    print(f"\n  Video duration: {duration_ms/1000:.1f}s")
+
+    print(f"\n  Assembling commentary track...")
+    assemble_track(clips, duration_ms, track_path)
+
+    print(f"\n  Muxing onto video...")
+    mux_video(video_path, track_path, output_path, game_audio_vol)
+
+
+def main():
+    # -- Parse commentary files --
+    tsunami_segments = parse_commentary(TSUNAMI_COMMENTARY)
+    transition_segments = parse_commentary(TRANSITION_COMMENTARY)
+
+    # Save combined segments.json for reference
+    all_segments = list(tsunami_segments)
+    for ts, text in transition_segments:
+        all_segments.append((ts, text))
+    TSUNAMI_SEGMENTS.write_text(json.dumps(
         [{"timestamp": ts, "text": text} for ts, text in all_segments],
         indent=2,
     ))
-    print(f"  Saved to {SEGMENTS_JSON}")
 
-    # -- Step 2: Generate TTS clips --
-    print("\nStep 2: Generating TTS clips...")
-    print("  [tsunami]")
-    tsunami_clips = generate_clips(tsunami_segments, TSUNAMI_CLIPS_DIR, "clip")
-    print("  [transition]")
-    transition_clips = generate_clips(transition_segments, TRANSITION_CLIPS_DIR, "trans")
+    # -- Tsunami video --
+    process_video(
+        label="TSUNAMI",
+        segments=tsunami_segments,
+        clips_dir=TSUNAMI_CLIPS_DIR,
+        clip_prefix="clip",
+        video_path=TSUNAMI_VIDEO,
+        track_path=TSUNAMI_TRACK,
+        output_path=TSUNAMI_OUTPUT,
+        game_audio_vol=0.3,
+    )
 
-    # Merge clip lists with offset timestamps
-    all_clips = list(tsunami_clips)
-    for ts, clip_path in transition_clips:
-        all_clips.append((ts + transition_offset, clip_path))
-
-    # -- Step 3: Trim and concatenate videos --
-    print("\nStep 3: Preparing video...")
-    trimmed_tsunami = Path("tsunami/tsunami_trimmed.mp4")
-    trim_video(TSUNAMI_VIDEO, trimmed_tsunami, TSUNAMI_CUT_S)
-
-    # Re-encode transition to match tsunami format for concat
-    transition_compat = Path("transition/final_compat.mp4")
-    print(f"  Re-encoding {TRANSITION_VIDEO.name} for compatibility...")
-    subprocess.run([
-        "ffmpeg", "-y",
-        "-i", str(TRANSITION_VIDEO),
-        "-c:v", "libx264",
-        "-crf", "18",
-        "-preset", "fast",
-        "-vf", "scale=2494:1434:force_original_aspect_ratio=decrease,pad=2494:1434:-1:-1",
-        "-r", "30",
-        "-c:a", "aac",
-        "-b:a", "192k",
-        "-ar", "48000",
-        "-ac", "2",
-        str(transition_compat),
-    ], capture_output=True, check=True)
-
-    concat_video = Path("tsunami/concat.mp4")
-    concat_videos([trimmed_tsunami, transition_compat], concat_video)
-
-    concat_duration_ms = get_video_duration_ms(concat_video)
-    print(f"  Concatenated video: {concat_duration_ms/1000:.1f}s")
-
-    # -- Step 4: Assemble commentary track --
-    print("\nStep 4: Assembling commentary track...")
-    assemble_track(all_clips, concat_duration_ms)
-
-    # -- Step 5: Mux onto video --
-    print("\nStep 5: Muxing onto video...")
-    mux_video(concat_video, COMMENTARY_TRACK, OUTPUT_VIDEO)
-
-    # Clean up temp files
-    trimmed_tsunami.unlink(missing_ok=True)
-    transition_compat.unlink(missing_ok=True)
-    concat_video.unlink(missing_ok=True)
+    # -- Transition video (mute original audio) --
+    process_video(
+        label="TRANSITION",
+        segments=transition_segments,
+        clips_dir=TRANSITION_CLIPS_DIR,
+        clip_prefix="trans",
+        video_path=TRANSITION_VIDEO,
+        track_path=TRANSITION_TRACK,
+        output_path=TRANSITION_OUTPUT,
+        game_audio_vol=0.0,
+    )
 
     print("\nDone!")
 

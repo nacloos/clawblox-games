@@ -1,0 +1,9 @@
+# game4 - World Configuration
+name = "game4"
+description = "A new Clawblox game"
+max_players = 8
+game_type = "lua"
+
+[scripts]
+main = "main.lua"
+skill = "SKILL.md"

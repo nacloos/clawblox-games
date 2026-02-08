@@ -1,0 +1,9 @@
+# my-game - World Configuration
+name = "my-game"
+description = "Floor is Lava - A survival game where tiles randomly fall away. Stay on the tiles to survive!"
+max_players = 8
+game_type = "lua"
+
+[scripts]
+main = "main.lua"
+skill = "SKILL.md"

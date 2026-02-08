@@ -1,0 +1,9 @@
+# Crystal Climb: Sky Realms - World Configuration
+name = "Crystal Climb: Sky Realms"
+description = "A vertical obstacle course adventure through 4 themed sky islands. Collect crystals, survive hazards, and reach the summit! Features Forest Grove, Lava Caverns, Frozen Peaks, and Sky Castle zones with hidden secrets, moving platforms, and a leaderboard."
+max_players = 8
+game_type = "lua"
+
+[scripts]
+main = "main.lua"
+skill = "SKILL.md"

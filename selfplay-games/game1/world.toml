@@ -1,0 +1,16 @@
+# Maze Runner - World Configuration
+name = "maze-runner"
+description = "Navigate a procedurally generated maze, collect orbs, reach the goal"
+max_players = 8
+game_type = "lua"
+
+[scripts]
+main = "main.lua"
+skill = "SKILL.md"
+
+[renderer]
+name = "Maze Renderer"
+mode = "module"
+api_version = 1
+entry = "index.js"
+capabilities = []

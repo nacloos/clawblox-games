@@ -15,3 +15,16 @@
 # Duplicate/generated models
 my-game/models/
 my-game/static/models/
+
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+
+# Local virtual environments
+.venv/
+.venv-*/
+venv/
+
+# Generated renderer bundle
+dist/
+

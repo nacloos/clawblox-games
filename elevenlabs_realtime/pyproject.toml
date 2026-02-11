@@ -1,0 +1,11 @@
+[project]
+name = "elevenlabs_realtime"
+version = "0.1.0"
+description = "ElevenLabs Realtime API"
+requires-python = ">=3.12"
+dependencies = [
+    "elevenlabs",
+    "websockets",
+    "python-dotenv",
+    "google-genai",
+]

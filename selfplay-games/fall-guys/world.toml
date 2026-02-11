@@ -13,3 +13,6 @@ mode = "module"
 api_version = 1
 entry = "index.js"
 capabilities = []
+
+[observation]
+radius = 40

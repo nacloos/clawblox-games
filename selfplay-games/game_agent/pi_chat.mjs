@@ -1,9 +1,9 @@
 import { Agent } from "/home/nacloos/Code/pi-mono/packages/agent/dist/index.js";
 import { getModel } from "/home/nacloos/Code/pi-mono/packages/ai/dist/index.js";
-import { createBashTool } from "/home/nacloos/Code/pi-mono/packages/coding-agent/dist/index.js";
+import { createCodingTools } from "/home/nacloos/Code/pi-mono/packages/coding-agent/dist/index.js";
 import { createInterface } from "node:readline";
 import { stdin as input, stdout as output } from "node:process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 
 function loadDotEnvIntoProcessEnv(envPath) {
@@ -46,15 +46,37 @@ if (!apiKey) {
 }
 
 const modelName = process.env.PI_MODEL || "claude-opus-4-6";
-const systemPrompt =
-	process.env.PI_SYSTEM_PROMPT || "You are a concise helpful assistant.";
+const scriptDir = path.dirname(new URL(import.meta.url).pathname);
+const agentDir = path.join(scriptDir, ".agent");
+mkdirSync(agentDir, { recursive: true });
+const memoryPath = path.join(agentDir, "SEMANTIC_MEMORY.md");
+if (!existsSync(memoryPath)) {
+	const templatePath = path.join(scriptDir, "templates", "SEMANTIC_MEMORY.md");
+	const template = existsSync(templatePath) ? readFileSync(templatePath, "utf8") : "";
+	writeFileSync(memoryPath, template);
+}
+
+function loadMemory() {
+	return readFileSync(memoryPath, "utf8").trim();
+}
+
+function buildSystemPrompt() {
+	const base = process.env.PI_SYSTEM_PROMPT || "";
+	const memory = loadMemory();
+	// const memoryBlock = `\n\nYou have a semantic memory file at ${memoryPath}. Update it with the edit or write tool whenever you learn something worth retaining. Only save valuable information that you won't be able to retrieve later on. Your memory is limited and precious. Make good use of it.`
+	// 	+ (memory ? `\n\n${memory}` : "");
+	const memoryBlock = `\n\nYou have a semantic memory file at ${memoryPath}. Make good use of your memory.`
+	+ (memory ? `\n\n${memory}` : "");
+
+	return base + memoryBlock;
+}
 
 const agent = new Agent({
 	initialState: {
-		systemPrompt,
+		systemPrompt: buildSystemPrompt(),
 		model: getModel("anthropic", modelName),
 		thinkingLevel: "off",
-		tools: [createBashTool(process.cwd())],
+		tools: createCodingTools(process.cwd()),
 	},
 	getApiKey: (provider) => (provider === "anthropic" ? apiKey : undefined),
 });

@@ -83,11 +83,24 @@ function buildSystemPrompt() {
 		}
 	}
 
+	const workspaceDir = path.join(scriptDir, "workspace");
+	const worldDir = path.join(workspaceDir, "world");
+	lines.push(
+		"## Workspace",
+		`Your workspace is ${workspaceDir}. Only work inside this directory.`,
+		`Your world is at ${worldDir}. You live your life in this world. Make it yours to not get bored.`,
+		`Documentation: ${path.join(worldDir, "docs")}`,
+		"",
+	);
+
 	return lines.filter(Boolean).join("\n");
 }
 
+const debugDir = path.join(scriptDir, "debug");
+mkdirSync(debugDir, { recursive: true });
+
 const systemPrompt = buildSystemPrompt();
-writeFileSync(path.join(scriptDir, "system-prompt.md"), systemPrompt);
+writeFileSync(path.join(debugDir, "system-prompt.md"), systemPrompt);
 
 const agent = new Agent({
 	initialState: {
@@ -131,7 +144,7 @@ agent.subscribe((event) => {
 		output.write(`\n[tool_call] ${tc.name}(${JSON.stringify(tc.arguments)})\n`);
 		return;
 	}
-	writeFileSync("conversation.json", JSON.stringify(agent.state.messages, null, 2));
+	writeFileSync(path.join(debugDir, "conversation.json"), JSON.stringify(agent.state.messages, null, 2));
 	if (event.type === "message_end" && event.message.role === "assistant") {
 		if (!assistantSawDelta) {
 			const text = event.message.content

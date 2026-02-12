@@ -19,14 +19,33 @@ ground.Color = Color3.fromRGB(85, 239, 196)
 ground:SetAttribute("RenderRole", "Ground")
 ground.Parent = Workspace
 
-local mesa = Instance.new("Part")
-mesa.Name = "Mesa"
-mesa.Size = Vector3.new(20, 4, 16)
-mesa.Position = Vector3.new(20, 2, 20)
-mesa.Anchored = true
-mesa.Color = Color3.fromRGB(200, 160, 100)
-mesa:SetAttribute("RenderRole", "Mesa")
-mesa.Parent = Workspace
+local mesas = {
+    -- Ground-level formations
+    { name = "LowStep",       size = {8, 2, 10},     pos = {8, 1, 18} },
+    { name = "LargeMesa",     size = {20, 4, 16},    pos = {20, 2, 20} },
+    { name = "SmallPlateau",  size = {10, 2, 8},     pos = {-30, 1, 28} },
+    { name = "SteppingStone", size = {8, 2.5, 8},    pos = {-18, 1.25, -12} },
+    { name = "Ridge",         size = {6, 3, 25},     pos = {35, 1.5, -10} },
+    { name = "TallMesa",      size = {12, 6, 10},    pos = {-25, 3, -20} },
+    -- NE climbing path: large mesa (4) -> high shelf (7) -> peak (11)
+    { name = "HighShelf",     size = {10, 7, 8},     pos = {25, 3.5, 28} },
+    { name = "Peak",          size = {5, 11, 5},     pos = {28, 5.5, 32} },
+    -- SW climbing path: tall mesa (6) -> tower base (7) -> summit (10) -> spire (13.5)
+    { name = "TowerBase",     size = {8, 7, 8},      pos = {-28, 3.5, -26} },
+    { name = "Summit",        size = {6, 10, 6},     pos = {-28, 5, -30} },
+    { name = "Spire",         size = {4, 13.5, 4},   pos = {-30, 6.75, -33} },
+}
+
+for _, m in ipairs(mesas) do
+    local mesa = Instance.new("Part")
+    mesa.Name = m.name
+    mesa.Size = Vector3.new(m.size[1], m.size[2], m.size[3])
+    mesa.Position = Vector3.new(m.pos[1], m.pos[2], m.pos[3])
+    mesa.Anchored = true
+    mesa.Color = Color3.fromRGB(200, 160, 100)
+    mesa:SetAttribute("RenderRole", "Mesa")
+    mesa.Parent = Workspace
+end
 
 --------------------------------------------------------------------------------
 -- PLAYER

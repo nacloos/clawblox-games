@@ -87,7 +87,7 @@ function buildSystemPrompt() {
 }
 
 const systemPrompt = buildSystemPrompt();
-writeFileSync(path.join(agentDir, "system-prompt.md"), systemPrompt);
+writeFileSync(path.join(scriptDir, "system-prompt.md"), systemPrompt);
 
 const agent = new Agent({
 	initialState: {

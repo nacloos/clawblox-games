@@ -1,0 +1,11 @@
+[project]
+name = "game-agent"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic",
+    "python-dotenv",
+    "websockets",
+    "sounddevice",
+    "numpy>=2.2.6",
+]

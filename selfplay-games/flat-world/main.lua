@@ -15,7 +15,7 @@ ground.Name = "Ground"
 ground.Size = Vector3.new(100, 1, 100)
 ground.Position = Vector3.new(0, -0.5, 0)
 ground.Anchored = true
-ground.Color = Color3.fromRGB(120, 180, 80)
+ground.Color = Color3.fromRGB(85, 239, 196)
 ground:SetAttribute("RenderRole", "Ground")
 ground.Parent = Workspace
 
@@ -36,8 +36,11 @@ local function setupPlayer(player)
     end
 
     if character then
+        character:SetAttribute("ModelUrl", "asset://player.glb")
+
         local hrp = character:FindFirstChild("HumanoidRootPart")
         if hrp then
+            hrp:SetAttribute("ModelYawOffsetDeg", 180)
             hrp.Position = Vector3.new(0, 5, 0)
         end
     end

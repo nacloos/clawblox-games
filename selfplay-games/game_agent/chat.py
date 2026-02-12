@@ -239,7 +239,6 @@ def run(args: argparse.Namespace) -> int:
                 if audio_streamer and audio_streamer.is_speaking():
                     audio_streamer.interrupt()
                     print("[audio interrupted]")
-                    continue
                 print("[Listening...]")
                 try:
                     user_input = stt_listener.listen_once()
@@ -266,6 +265,7 @@ def run(args: argparse.Namespace) -> int:
             try:
                 print("\nClaude: ", end="", flush=True)
                 reply_parts: List[str] = []
+                tts_buffer = ""
                 interrupted = False
                 for chunk in chat_turn_stream(
                     claude=claude,
@@ -279,6 +279,11 @@ def run(args: argparse.Namespace) -> int:
                         break
                     print(chunk, end="", flush=True)
                     reply_parts.append(chunk)
+                    if audio_streamer:
+                        tts_buffer += chunk
+                        emit_text, tts_buffer = _pop_tts_emit_text(tts_buffer)
+                        if emit_text.strip():
+                            audio_streamer.send_text_chunk(emit_text.strip() + " ")
                 print("\n")
 
                 reply = "".join(reply_parts).strip()
@@ -286,8 +291,9 @@ def run(args: argparse.Namespace) -> int:
                     if interrupted:
                         audio_streamer.interrupt()
                     else:
-                        if reply:
-                            audio_streamer.enqueue_text(reply)
+                        if tts_buffer.strip():
+                            audio_streamer.send_text_chunk(tts_buffer.strip())
+                        audio_streamer.flush_text()
 
                 if interrupted:
                     print("[response interrupted]\n")

@@ -74,8 +74,6 @@ class AgentAudioStreamer:
         self._streaming_stats: Optional[dict[str, float | int | None]] = None
         self._speaking = threading.Event()
         self._interrupt_requested = threading.Event()
-        self._ws_lock = threading.Lock()
-        self._active_ws: Optional[websockets.sync.client.ClientConnection] = None
 
     def start(self) -> None:
         """Start worker thread, block until WS + ffplay are ready."""
@@ -115,13 +113,6 @@ class AgentAudioStreamer:
     def interrupt(self) -> None:
         """Abort current/pending streaming audio for the active turn."""
         self._interrupt_requested.set()
-        with self._ws_lock:
-            ws = self._active_ws
-        if ws is not None:
-            try:
-                ws.close()
-            except Exception:
-                pass
         done = threading.Event()
         self._queue.put(("interrupt", done))
         done.wait(timeout=2)
@@ -190,8 +181,6 @@ class AgentAudioStreamer:
         ws: Optional[websockets.sync.client.ClientConnection] = None
         try:
             ws = self._connect_ws()
-            with self._ws_lock:
-                self._active_ws = ws
         except Exception as exc:
             self._start_error = f"unable to connect ElevenLabs WS: {exc}"
             self._ready.set()
@@ -212,12 +201,27 @@ class AgentAudioStreamer:
                     break
 
                 if isinstance(item, tuple) and item[0] == "interrupt":
+                    ctx = self._streaming_ctx
+                    if ws is not None and ctx:
+                        try:
+                            ws.send(json.dumps({
+                                "context_id": ctx,
+                                "close_context": True,
+                            }))
+                        except Exception as exc:
+                            print(f"[audio] close_context error: {exc}")
                     try:
                         if ws is not None:
-                            ws.close()
+                            self._drain_audio(
+                                context_id=ctx or "",
+                                ws=ws,
+                                ffplay=ffplay,
+                                stats=self._new_audio_stats(),
+                                timeout=0.01,
+                                stop_on_final=False,
+                            )
                     except Exception:
                         pass
-                    ws = None
                     self._streaming_ctx = None
                     self._streaming_stats = None
                     item[1].set()
@@ -241,8 +245,6 @@ class AgentAudioStreamer:
                 if ws is None:
                     try:
                         ws = self._connect_ws()
-                        with self._ws_lock:
-                            self._active_ws = ws
                     except Exception as exc:
                         print(f"[audio] reconnect failed: {exc}")
                         if isinstance(item, tuple) and item[0] == "flush":
@@ -254,6 +256,8 @@ class AgentAudioStreamer:
                     if self._streaming_ctx is None:
                         self._streaming_ctx = self._next_context_id()
                         self._streaming_stats = self._new_audio_stats()
+                        self._interrupt_requested.clear()
+                        self._speaking.set()
                     try:
                         ws.send(json.dumps({
                             "context_id": self._streaming_ctx,
@@ -275,10 +279,9 @@ class AgentAudioStreamer:
                         except Exception:
                             pass
                         ws = None
-                        with self._ws_lock:
-                            self._active_ws = None
                         self._streaming_ctx = None
                         self._streaming_stats = None
+                        self._speaking.clear()
                     continue
 
                 # Streaming flush: send flush, receive audio, signal done
@@ -303,11 +306,18 @@ class AgentAudioStreamer:
                                 timeout=_RECV_TIMEOUT,
                                 stop_on_final=True,
                             )
-                            if not finished and int(stats["msg_count"]) == 0:
+                            if not self._interrupt_requested.is_set() and not finished and int(stats["msg_count"]) == 0:
                                 print("[audio] flush warning: no final marker before timeout")
                             self._print_audio_stats(stats)
                             print(f"[audio] stream done in "
                                   f"{time.monotonic() - t0:.2f}s")
+                            try:
+                                ws.send(json.dumps({
+                                    "context_id": ctx,
+                                    "close_context": True,
+                                }))
+                            except Exception:
+                                pass
                         except Exception as exc:
                             print(f"[audio] flush error: {exc}")
                             try:
@@ -315,8 +325,9 @@ class AgentAudioStreamer:
                             except Exception:
                                 pass
                             ws = None
-                            with self._ws_lock:
-                                self._active_ws = None
+                        finally:
+                            self._speaking.clear()
+                            self._interrupt_requested.clear()
                     item[1].set()
                     continue
 
@@ -336,8 +347,6 @@ class AgentAudioStreamer:
                         except Exception:
                             pass
                         ws = None
-                        with self._ws_lock:
-                            self._active_ws = None
                         continue
                     finally:
                         self._speaking.clear()
@@ -350,8 +359,6 @@ class AgentAudioStreamer:
                     ws.close()
                 except Exception:
                     pass
-            with self._ws_lock:
-                self._active_ws = None
             self._speaking.clear()
             if ffplay.stdin:
                 ffplay.stdin.close()
@@ -386,18 +393,17 @@ class AgentAudioStreamer:
         """Drain currently available audio frames for a context."""
         saw_final = False
         consecutive_timeouts = 0
+        max_timeouts = 6 if stop_on_final else 1
         while True:
             if self._interrupt_requested.is_set():
                 break
             try:
-                raw = ws.recv(timeout=timeout)
+                raw = ws.recv(timeout=0.2 if stop_on_final else timeout)
             except TimeoutError:
-                if stop_on_final:
-                    consecutive_timeouts += 1
-                    if consecutive_timeouts >= 2:
-                        break
-                    continue
-                break
+                consecutive_timeouts += 1
+                if consecutive_timeouts >= max_timeouts:
+                    break
+                continue
             consecutive_timeouts = 0
 
             data = json.loads(raw)

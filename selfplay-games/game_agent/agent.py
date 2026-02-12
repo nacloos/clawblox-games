@@ -48,6 +48,9 @@ You are an expert real-time game bot controller.
 You receive game observations and must output ONLY a JSON object.
 No markdown, no prose.
 
+On the first step you receive the full game state.
+On subsequent steps you receive only what changed since the last observation.
+
 IMPORTANT: The local /input endpoint requires this exact action schema:
 {
   "type": "<ActionName>",
@@ -76,6 +79,176 @@ Game skill.md (read this first, then process the observation):
 
 {skill_md}
 """.strip()
+
+
+def _rpos(pos: list) -> tuple:
+    """Round position to 1 decimal to filter physics jitter."""
+    return tuple(round(x, 1) for x in pos)
+
+
+# Attributes that are camera/rendering internals — not useful for decision making
+_IGNORED_ATTRIBUTES = frozenset({
+    "ViewOriginX", "ViewOriginY", "ViewOriginZ",
+    "ViewForwardX", "ViewForwardY", "ViewForwardZ",
+    "ViewFovDeg",
+    "RenderRole",
+    "ModelUrl",
+})
+
+# Entity names that mirror player.position — skip to avoid duplicate diffs
+_IGNORED_ENTITY_NAMES = frozenset({
+    "HumanoidRootPart",
+})
+
+
+def _diff_attributes(
+    prev_attrs: Dict[str, Any],
+    curr_attrs: Dict[str, Any],
+    label: str,
+    changes: List[str],
+) -> None:
+    for key in sorted(set(prev_attrs) | set(curr_attrs)):
+        if key in _IGNORED_ATTRIBUTES:
+            continue
+        pv = prev_attrs.get(key)
+        cv = curr_attrs.get(key)
+        if pv != cv:
+            changes.append(f"{label} {key}: {pv} -> {cv}")
+
+
+def _diff_player(
+    prev: Dict[str, Any],
+    curr: Dict[str, Any],
+    label: str,
+    changes: List[str],
+) -> None:
+    if not prev or not curr:
+        return
+    pp = _rpos(prev.get("position", [0, 0, 0]))
+    cp = _rpos(curr.get("position", [0, 0, 0]))
+    if pp != cp:
+        changes.append(f"{label} position: {pp} -> {cp}")
+    ph = prev.get("health")
+    ch = curr.get("health")
+    if ph is not None and ch is not None and round(ph, 1) != round(ch, 1):
+        changes.append(f"{label} health: {ph} -> {ch}")
+    _diff_attributes(
+        prev.get("attributes", {}),
+        curr.get("attributes", {}),
+        label,
+        changes,
+    )
+
+
+def _diff_entity(
+    prev: Dict[str, Any],
+    curr: Dict[str, Any],
+    changes: List[str],
+) -> None:
+    name = curr.get("name", curr.get("id", "?"))
+    pp = _rpos(prev.get("position", [0, 0, 0]))
+    cp = _rpos(curr.get("position", [0, 0, 0]))
+    if pp != cp:
+        changes.append(f"{name} position: {pp} -> {cp}")
+    prev_size = prev.get("size")
+    curr_size = curr.get("size")
+    if prev_size and curr_size and _rpos(prev_size) != _rpos(curr_size):
+        changes.append(f"{name} size: {_rpos(prev_size)} -> {_rpos(curr_size)}")
+    _diff_attributes(
+        prev.get("attributes", {}),
+        curr.get("attributes", {}),
+        name,
+        changes,
+    )
+
+
+def clean_observation(obs: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip noisy/internal fields from a full observation before sending to LLM."""
+    import copy
+    out = copy.deepcopy(obs)
+    # Strip ignored attributes from player
+    player = out.get("player", {})
+    attrs = player.get("attributes", {})
+    for key in list(attrs):
+        if key in _IGNORED_ATTRIBUTES:
+            del attrs[key]
+    # Strip ignored attributes from other players
+    for p in out.get("other_players", []):
+        pa = p.get("attributes", {})
+        for key in list(pa):
+            if key in _IGNORED_ATTRIBUTES:
+                del pa[key]
+    # Strip ignored entities and ignored attributes from remaining entities
+    entities = out.get("world", {}).get("entities", [])
+    filtered = []
+    for e in entities:
+        if e.get("name") in _IGNORED_ENTITY_NAMES:
+            continue
+        ea = e.get("attributes", {})
+        for key in list(ea):
+            if key in _IGNORED_ATTRIBUTES:
+                del ea[key]
+        filtered.append(e)
+    if "world" in out:
+        out["world"]["entities"] = filtered
+    # Strip tick (internal counter, not useful)
+    out.pop("tick", None)
+    return out
+
+
+def diff_observations(prev: Dict[str, Any], curr: Dict[str, Any]) -> str:
+    """Compute human-readable diff between two /observe snapshots."""
+    changes: List[str] = []
+
+    # Game status
+    if prev.get("game_status") != curr.get("game_status"):
+        changes.append(
+            f"Game status: {prev.get('game_status')} -> {curr.get('game_status')}"
+        )
+
+    # Player
+    _diff_player(prev.get("player", {}), curr.get("player", {}), "You", changes)
+
+    # Other players (keyed by id)
+    prev_others = {p["id"]: p for p in prev.get("other_players", [])}
+    curr_others = {p["id"]: p for p in curr.get("other_players", [])}
+
+    for pid in sorted(set(prev_others) - set(curr_others)):
+        changes.append(f"Player {pid} left")
+    for pid in sorted(set(curr_others) - set(prev_others)):
+        p = curr_others[pid]
+        pos = _rpos(p.get("position", [0, 0, 0]))
+        changes.append(f"Player {pid} appeared at {pos}")
+    for pid in sorted(set(prev_others) & set(curr_others)):
+        _diff_player(prev_others[pid], curr_others[pid], f"Player {pid}", changes)
+
+    # Entities
+    prev_ents = {e["id"]: e for e in prev.get("world", {}).get("entities", [])}
+    curr_ents = {e["id"]: e for e in curr.get("world", {}).get("entities", [])}
+
+    for eid in sorted(set(prev_ents) - set(curr_ents), key=str):
+        e = prev_ents[eid]
+        if e.get("name") in _IGNORED_ENTITY_NAMES:
+            continue
+        changes.append(f"{e.get('name', eid)} removed")
+    for eid in sorted(set(curr_ents) - set(prev_ents), key=str):
+        e = curr_ents[eid]
+        if e.get("name") in _IGNORED_ENTITY_NAMES:
+            continue
+        pos = _rpos(e.get("position", [0, 0, 0]))
+        changes.append(f"{e.get('name', eid)} appeared at {pos}")
+    for eid in sorted(set(prev_ents) & set(curr_ents), key=str):
+        if curr_ents[eid].get("name") in _IGNORED_ENTITY_NAMES:
+            continue
+        _diff_entity(prev_ents[eid], curr_ents[eid], changes)
+
+    # Events (ephemeral — forward all new ones)
+    for event in curr.get("events", []):
+        changes.append(f"Event: {event}")
+
+    if not changes:
+        return "No changes."
+    return "State changes:\n" + "\n".join(f"- {c}" for c in changes)
 
 
 class ClawbloxAPIError(RuntimeError):
@@ -348,7 +521,7 @@ def run(args: argparse.Namespace) -> int:
     script_path = Path(__file__).resolve()
     repo_env = script_path.parents[2] / ".env"
     load_dotenv(repo_env)
-
+    
     anthropic_token = (
         Path.home().joinpath(".claude", ".credentials.json").read_text(encoding="utf-8")
         if False
@@ -379,7 +552,7 @@ def run(args: argparse.Namespace) -> int:
     log_path.write_text("", encoding="utf-8")
 
     web_base = api.api_base.rstrip("/")
-    print("Selected game: Fall Guys (local runtime)")
+    print("Selected game: local runtime")
     print(f"Live URL: {web_base}/")
     print(f"Browse URL: {web_base}/browse")
     print(f"Anthropic auth mode: {auth_mode}")
@@ -398,7 +571,7 @@ def run(args: argparse.Namespace) -> int:
     if skill_md.lstrip().lower().startswith("<!doctype html") or "<html" in skill_md[:300].lower():
         raise ClawbloxAPIError("No valid skill.md found: received HTML from /skill.md")
 
-    append_conversation_log(log_path, "RUN_START", f"game=Fall Guys id=local model={args.model}")
+    append_conversation_log(log_path, "RUN_START", f"game=local model={args.model}")
     append_conversation_log(log_path, "ANTHROPIC_AUTH_MODE", auth_mode)
     append_conversation_log(log_path, "SKILL_SOURCE", f"api:{api.api_base}/skill.md")
     append_conversation_log(log_path, "SKILL_MD", skill_md)
@@ -408,6 +581,7 @@ def run(args: argparse.Namespace) -> int:
     print("Joined game")
 
     previous_action_error: Optional[str] = None
+    previous_obs: Optional[Dict[str, Any]] = None
     try:
         for step in range(args.max_steps):
             obs = api.observe()
@@ -421,11 +595,20 @@ def run(args: argparse.Namespace) -> int:
                 append_conversation_log(log_path, "GAME_STATUS", status)
                 break
 
-            user_payload = {
-                "observation": obs,
-                "last_action_error": previous_action_error,
-                "instruction": "Return only the JSON object now.",
-            }
+            if previous_obs is None:
+                user_payload = {
+                    "observation": clean_observation(obs),
+                    "last_action_error": previous_action_error,
+                    "instruction": "Return only the JSON object now.",
+                }
+            else:
+                diff = diff_observations(previous_obs, obs)
+                user_payload = {
+                    "state_changes": diff,
+                    "last_action_error": previous_action_error,
+                    "instruction": "Return only the JSON object now.",
+                }
+            previous_obs = obs
             append_conversation_log(
                 log_path,
                 f"STEP_{step}_USER_OBSERVATION",

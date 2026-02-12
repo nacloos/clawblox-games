@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import select
 import sys
 import urllib.error
 import urllib.request
@@ -28,23 +29,30 @@ from audio import AgentAudioStreamer, AudioConfig, MicSTTListener
 
 
 SYSTEM_PROMPT = "You are a helpful assistant. Be concise."
+_TTS_PUNCT = (".", "!", "?", "\n", ":", ";")
+_TTS_MIN_SENTENCE_CHARS = 24
+_TTS_MAX_BUFFER_CHARS = 80
 
 
 def is_anthropic_setup_token(token: str) -> bool:
     return "sk-ant-oat" in token
 
 
-def create_message_setup_token(
+from typing import Callable, Generator
+
+
+def _stream_setup_token(
     token: str,
     model: str,
     system_prompt: str,
     messages: List[Dict[str, str]],
     max_tokens: int = 1024,
-) -> str:
+) -> Generator[str, None, None]:
+    """Stream text deltas via raw SSE from the Anthropic API (setup-token auth)."""
     url = "https://api.anthropic.com/v1/messages"
     headers = {
         "Content-Type": "application/json",
-        "Accept": "application/json",
+        "Accept": "text/event-stream",
         "Authorization": f"Bearer {token}",
         "anthropic-version": "2023-06-01",
         "anthropic-dangerous-direct-browser-access": "true",
@@ -60,6 +68,7 @@ def create_message_setup_token(
     body = {
         "model": model,
         "max_tokens": max_tokens,
+        "stream": True,
         "system": system_prompt,
         "messages": messages,
     }
@@ -70,25 +79,47 @@ def create_message_setup_token(
         headers=headers,
     )
     with urllib.request.urlopen(req, timeout=120) as resp:
-        raw = resp.read().decode("utf-8")
+        for raw_line in resp:
+            line = raw_line.decode("utf-8").rstrip("\n")
+            if not line.startswith("data: "):
+                continue
+            data = json.loads(line[6:])
+            if data.get("type") == "content_block_delta":
+                delta = data.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    yield delta["text"]
+            elif data.get("type") == "message_stop":
+                return
 
-    parsed = json.loads(raw)
-    parts: List[str] = []
-    for block in parsed.get("content", []):
-        if isinstance(block, dict) and block.get("type") == "text":
-            parts.append(str(block.get("text", "")))
-    return "\n".join(parts).strip()
+
+def _stream_sdk(
+    claude: Anthropic,
+    model: str,
+    system_prompt: str,
+    messages: List[Dict[str, str]],
+    max_tokens: int = 1024,
+) -> Generator[str, None, None]:
+    """Stream text deltas via the Anthropic Python SDK."""
+    with claude.messages.stream(
+        model=model,
+        max_tokens=max_tokens,
+        system=system_prompt,
+        messages=messages,
+    ) as stream:
+        for text in stream.text_stream:
+            yield text
 
 
-def chat_turn(
+def chat_turn_stream(
     claude: Optional[Anthropic],
     anthropic_token: str,
     model: str,
     system_prompt: str,
     messages: List[Dict[str, str]],
-) -> str:
+) -> Generator[str, None, None]:
+    """Yield text chunks as they arrive from the LLM."""
     if is_anthropic_setup_token(anthropic_token):
-        return create_message_setup_token(
+        yield from _stream_setup_token(
             token=anthropic_token,
             model=model,
             system_prompt=system_prompt,
@@ -97,17 +128,46 @@ def chat_turn(
     else:
         if claude is None:
             raise RuntimeError("Anthropic client is missing")
-        resp = claude.messages.create(
+        yield from _stream_sdk(
+            claude=claude,
             model=model,
-            max_tokens=1024,
-            system=system_prompt,
+            system_prompt=system_prompt,
             messages=messages,
         )
-        parts: List[str] = []
-        for block in resp.content:
-            if getattr(block, "type", None) == "text":
-                parts.append(getattr(block, "text", ""))
-        return "\n".join(parts).strip()
+
+
+def _pop_tts_emit_text(buffer: str) -> tuple[str, str]:
+    """Pop text suitable for incremental TTS or return empty emit text."""
+    last_boundary = -1
+    for marker in _TTS_PUNCT:
+        idx = buffer.rfind(marker)
+        if idx > last_boundary:
+            last_boundary = idx
+
+    if last_boundary + 1 >= _TTS_MIN_SENTENCE_CHARS:
+        return buffer[: last_boundary + 1], buffer[last_boundary + 1 :]
+
+    if len(buffer) >= _TTS_MAX_BUFFER_CHARS:
+        split_idx = buffer.rfind(" ", _TTS_MIN_SENTENCE_CHARS, _TTS_MAX_BUFFER_CHARS)
+        if split_idx == -1:
+            split_idx = _TTS_MAX_BUFFER_CHARS
+        return buffer[:split_idx], buffer[split_idx:]
+
+    return "", buffer
+
+
+def _stdin_enter_pressed() -> bool:
+    """Non-blocking check for Enter on stdin (TTY only)."""
+    if not sys.stdin.isatty():
+        return False
+    try:
+        ready, _, _ = select.select([sys.stdin], [], [], 0.0)
+    except (OSError, ValueError):
+        return False
+    if not ready:
+        return False
+    line = sys.stdin.readline()
+    return line.strip() == ""
 
 
 def parse_args() -> argparse.Namespace:
@@ -160,9 +220,12 @@ def run(args: argparse.Namespace) -> int:
 
     print(f"Model: {args.model}")
     if stt_listener:
-        print("Press Enter to record, VAD auto-commits on silence. Ctrl+C or 'quit' to exit.\n")
+        print("Press Enter to record, VAD auto-commits on silence.")
+        print("If audio is speaking, Enter interrupts it; press Enter again to record.")
+        print("During Claude response, press Enter to interrupt. Ctrl+C or 'quit' to exit.\n")
     else:
-        print("Type your message. Ctrl+C or 'quit' to exit.\n")
+        print("Type your message.")
+        print("During Claude response, press Enter to interrupt. Ctrl+C or 'quit' to exit.\n")
 
     messages: List[Dict[str, str]] = []
 
@@ -173,6 +236,10 @@ def run(args: argparse.Namespace) -> int:
                     input("[Enter to speak] ")
                 except EOFError:
                     break
+                if audio_streamer and audio_streamer.is_speaking():
+                    audio_streamer.interrupt()
+                    print("[audio interrupted]")
+                    continue
                 print("[Listening...]")
                 try:
                     user_input = stt_listener.listen_once()
@@ -197,23 +264,42 @@ def run(args: argparse.Namespace) -> int:
             messages.append({"role": "user", "content": user_input})
 
             try:
-                reply = chat_turn(
+                print("\nClaude: ", end="", flush=True)
+                reply_parts: List[str] = []
+                interrupted = False
+                for chunk in chat_turn_stream(
                     claude=claude,
                     anthropic_token=anthropic_token,
                     model=args.model,
                     system_prompt=args.system,
                     messages=messages,
-                )
+                ):
+                    if _stdin_enter_pressed():
+                        interrupted = True
+                        break
+                    print(chunk, end="", flush=True)
+                    reply_parts.append(chunk)
+                print("\n")
+
+                reply = "".join(reply_parts).strip()
+                if audio_streamer:
+                    if interrupted:
+                        audio_streamer.interrupt()
+                    else:
+                        if reply:
+                            audio_streamer.enqueue_text(reply)
+
+                if interrupted:
+                    print("[response interrupted]\n")
+                    if not reply:
+                        messages.pop()
+                    continue
             except Exception as exc:
-                print(f"Error: {exc}", file=sys.stderr)
+                print(f"\nError: {exc}", file=sys.stderr)
                 messages.pop()
                 continue
 
             messages.append({"role": "assistant", "content": reply})
-            print(f"\nClaude: {reply}\n")
-
-            if audio_streamer:
-                audio_streamer.enqueue_text(reply)
 
     except KeyboardInterrupt:
         print()

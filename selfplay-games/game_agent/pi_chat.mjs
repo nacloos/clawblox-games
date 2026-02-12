@@ -3,7 +3,7 @@ import { getModel } from "/home/nacloos/Code/pi-mono/packages/ai/dist/index.js";
 import { createBashTool } from "/home/nacloos/Code/pi-mono/packages/coding-agent/dist/index.js";
 import { createInterface } from "node:readline";
 import { stdin as input, stdout as output } from "node:process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 function loadDotEnvIntoProcessEnv(envPath) {
@@ -83,6 +83,15 @@ agent.subscribe((event) => {
 		output.write(event.assistantMessageEvent.delta);
 		return;
 	}
+	if (
+		event.type === "message_update" &&
+		event.assistantMessageEvent.type === "toolcall_end"
+	) {
+		const tc = event.assistantMessageEvent.toolCall;
+		output.write(`\n[tool_call] ${tc.name}(${JSON.stringify(tc.arguments)})\n`);
+		return;
+	}
+	writeFileSync("conversation.json", JSON.stringify(agent.state.messages, null, 2));
 	if (event.type === "message_end" && event.message.role === "assistant") {
 		if (!assistantSawDelta) {
 			const text = event.message.content

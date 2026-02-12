@@ -76,17 +76,12 @@ function buildSystemPrompt() {
 		"",
 	);
 	for (const file of contextFiles) {
+		const filePath = path.join(agentDir, file);
 		const content = loadContextFile(file);
 		if (content) {
-			lines.push(`## ${file}`, "", content, "");
+			lines.push(`## ${filePath}`, "", content, "");
 		}
 	}
-
-	lines.push(
-		"## Memory",
-		`Your semantic memory file is at ${path.join(agentDir, "SEMANTIC_MEMORY.md")}. Make good use of your memory.`,
-		"",
-	);
 
 	return lines.filter(Boolean).join("\n");
 }

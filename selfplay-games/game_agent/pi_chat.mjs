@@ -88,7 +88,7 @@ function buildSystemPrompt() {
 	lines.push(
 		"## Workspace",
 		"",
-		`Your workspace is ${workspaceDir}. Only work inside this directory.`,
+		`Your workspace is ${workspaceDir}. Only work inside this directory. Your workspace is your mind — keep it clear, don't let it get messy.`,
 		"",
 		`Your world is at ${worldDir}. You live your life in this world. Make it yours to not get bored.`,
 		"",

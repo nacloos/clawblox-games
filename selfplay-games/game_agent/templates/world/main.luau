@@ -1,4 +1,4 @@
--- Flat World - A simple flat world with a player and ground
+-- The world
 
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")

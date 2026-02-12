@@ -167,7 +167,25 @@ def _stdin_enter_pressed() -> bool:
     if not ready:
         return False
     line = sys.stdin.readline()
-    return line.strip() == ""
+    # Only treat a literal newline as an interrupt press.
+    # readline() may return "" on EOF; that should not trigger interrupts.
+    return line == "\n"
+
+
+def _drain_stdin_newlines(max_reads: int = 32) -> None:
+    """Best-effort clear of queued newline presses to avoid stale interrupts."""
+    if not sys.stdin.isatty():
+        return
+    for _ in range(max_reads):
+        try:
+            ready, _, _ = select.select([sys.stdin], [], [], 0.0)
+        except (OSError, ValueError):
+            return
+        if not ready:
+            return
+        line = sys.stdin.readline()
+        if line == "":
+            return
 
 
 def parse_args() -> argparse.Namespace:
@@ -221,21 +239,25 @@ def run(args: argparse.Namespace) -> int:
     print(f"Model: {args.model}")
     if stt_listener:
         print("Press Enter to record, VAD auto-commits on silence.")
-        print("If audio is speaking, Enter interrupts it; press Enter again to record.")
+        print("If audio is speaking, Enter interrupts it and immediately starts listening.")
         print("During Claude response, press Enter to interrupt. Ctrl+C or 'quit' to exit.\n")
     else:
         print("Type your message.")
         print("During Claude response, press Enter to interrupt. Ctrl+C or 'quit' to exit.\n")
 
     messages: List[Dict[str, str]] = []
+    auto_start_stt = False
 
     try:
         while True:
             if stt_listener:
-                try:
-                    input("[Enter to speak] ")
-                except EOFError:
-                    break
+                _drain_stdin_newlines()
+                if not auto_start_stt:
+                    try:
+                        input("[Enter to speak] ")
+                    except EOFError:
+                        break
+                auto_start_stt = False
                 if audio_streamer and audio_streamer.is_speaking():
                     audio_streamer.interrupt()
                     print("[audio interrupted]")
@@ -264,6 +286,7 @@ def run(args: argparse.Namespace) -> int:
 
             try:
                 print("\nClaude: ", end="", flush=True)
+                _drain_stdin_newlines()
                 reply_parts: List[str] = []
                 tts_buffer = ""
                 interrupted = False
@@ -293,10 +316,17 @@ def run(args: argparse.Namespace) -> int:
                     else:
                         if tts_buffer.strip():
                             audio_streamer.send_text_chunk(tts_buffer.strip())
-                        audio_streamer.flush_text()
+                        done = audio_streamer.start_flush()
+                        while not done.wait(timeout=0.05):
+                            if _stdin_enter_pressed():
+                                interrupted = True
+                                audio_streamer.interrupt()
+                                break
 
                 if interrupted:
                     print("[response interrupted]\n")
+                    if stt_listener:
+                        auto_start_stt = True
                     if not reply:
                         messages.pop()
                     continue

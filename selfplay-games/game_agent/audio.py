@@ -22,6 +22,7 @@ ELEVENLABS_STT_SAMPLE_RATE = 16000
 # Timeout waiting for audio chunks after flush (seconds).
 # If ElevenLabs doesn't send more data within this window, assume utterance is done.
 _RECV_TIMEOUT = 1.0
+_FLUSH_IDLE_TIMEOUT = 2.5
 
 
 @dataclass
@@ -103,9 +104,14 @@ class AgentAudioStreamer:
 
     def flush_text(self) -> None:
         """Flush the current streaming context and block until audio finishes."""
+        done = self.start_flush()
+        done.wait(timeout=60)
+
+    def start_flush(self) -> threading.Event:
+        """Flush current streaming context and return completion event."""
         done = threading.Event()
         self._queue.put(("flush", done))
-        done.wait(timeout=60)
+        return done
 
     def is_speaking(self) -> bool:
         return self._speaking.is_set()
@@ -168,6 +174,23 @@ class AgentAudioStreamer:
             bufsize=0,
         )
 
+    def _restart_ffplay(self, ffplay: subprocess.Popen) -> subprocess.Popen:
+        """Stop current playback immediately and start a fresh ffplay process."""
+        try:
+            if ffplay.stdin:
+                ffplay.stdin.close()
+        except Exception:
+            pass
+        try:
+            ffplay.kill()
+        except Exception:
+            pass
+        try:
+            ffplay.wait(timeout=1)
+        except Exception:
+            pass
+        return self._start_ffplay()
+
     def _run(self) -> None:
         # Start ffplay
         try:
@@ -222,6 +245,10 @@ class AgentAudioStreamer:
                             )
                     except Exception:
                         pass
+                    try:
+                        ffplay = self._restart_ffplay(ffplay)
+                    except Exception as exc:
+                        print(f"[audio] ffplay restart error: {exc}")
                     self._streaming_ctx = None
                     self._streaming_stats = None
                     item[1].set()
@@ -392,24 +419,26 @@ class AgentAudioStreamer:
     ) -> bool:
         """Drain currently available audio frames for a context."""
         saw_final = False
-        consecutive_timeouts = 0
-        max_timeouts = 6 if stop_on_final else 1
+        last_msg_at = time.monotonic()
         while True:
             if self._interrupt_requested.is_set():
                 break
             try:
                 raw = ws.recv(timeout=0.2 if stop_on_final else timeout)
             except TimeoutError:
-                consecutive_timeouts += 1
-                if consecutive_timeouts >= max_timeouts:
+                if stop_on_final and (time.monotonic() - last_msg_at) < _FLUSH_IDLE_TIMEOUT:
+                    continue
+                if not stop_on_final:
+                    break
+                if (time.monotonic() - last_msg_at) >= _FLUSH_IDLE_TIMEOUT:
                     break
                 continue
-            consecutive_timeouts = 0
+            last_msg_at = time.monotonic()
 
             data = json.loads(raw)
 
             # Skip messages from previous contexts
-            msg_ctx = data.get("context_id")
+            msg_ctx = data.get("context_id") or data.get("contextId")
             if msg_ctx and msg_ctx != context_id:
                 continue
 

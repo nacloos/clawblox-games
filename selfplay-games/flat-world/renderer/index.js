@@ -114,6 +114,32 @@ function createEntityVisual(entity) {
     return group
   }
 
+  if (role === 'Mesa') {
+    const group = new THREE.Group()
+    const w = size[0], h = size[1], d = size[2]
+
+    const layers = [
+      { frac: 0.0,  hFrac: 0.40, color: 0x8b6940 },
+      { frac: 0.40, hFrac: 0.40, color: 0xa57d50 },
+      { frac: 0.80, hFrac: 0.20, color: 0x55cfb0 },
+    ]
+
+    for (const layer of layers) {
+      const lh = h * layer.hFrac
+      const ly = -h / 2 + h * layer.frac + lh / 2
+      const mesh = new THREE.Mesh(
+        new THREE.BoxGeometry(w, lh, d),
+        new THREE.MeshStandardMaterial({ color: layer.color, roughness: 0.9, metalness: 0.0 }),
+      )
+      mesh.position.y = ly
+      mesh.castShadow = true
+      mesh.receiveShadow = true
+      group.add(mesh)
+    }
+
+    return group
+  }
+
   // Default: box with entity color
   const color = entity.render && entity.render.color
     ? (Math.round(entity.render.color[0] * 255) << 16) |

@@ -19,6 +19,15 @@ ground.Color = Color3.fromRGB(85, 239, 196)
 ground:SetAttribute("RenderRole", "Ground")
 ground.Parent = Workspace
 
+local mesa = Instance.new("Part")
+mesa.Name = "Mesa"
+mesa.Size = Vector3.new(20, 4, 16)
+mesa.Position = Vector3.new(20, 2, 20)
+mesa.Anchored = true
+mesa.Color = Color3.fromRGB(200, 160, 100)
+mesa:SetAttribute("RenderRole", "Mesa")
+mesa.Parent = Workspace
+
 --------------------------------------------------------------------------------
 -- PLAYER
 --------------------------------------------------------------------------------

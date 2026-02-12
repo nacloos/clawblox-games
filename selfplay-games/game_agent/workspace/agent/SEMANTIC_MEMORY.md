@@ -48,6 +48,41 @@ This is the only reliable way to jump onto elevated platforms. Jump height is ~7
 - **West route:** Ground → SteppingStone(2.5) → TallMesa(6) → TowerBase(7) → Summit(10) → Spire(13.5) 🏆
 - Both routes fully verified and climbable. West route speed run: ~20s from ground.
 
+### Speed Run Records
+- **East route** (Ground → LowStep → LargeMesa → HighShelf → Peak): **9.0s** from spawn
+- **West route** (Ground → SteppingStone → TallMesa → TowerBase → Summit → Spire): **9.3s** from map center
+- **Spawn to Spire (optimized):** **7.6s** — tightened all sleep timings. Current PB.
+- **The Full Mountain** (Peak → drop → cross map → Spire): ~12s total
+- Key optimization: reduce sleep between stop/jump/move to 0.04s, reduce platform traversal sleeps to minimum needed for landing confirmation.
+
+### World Tour Record
+- **All 11 structures summited in 30.3s** — PERFECT RUN 🏆
+- Route: LowStep → LargeMesa → HighShelf → Peak → (drop) → SmallPlateau → Ridge → SteppingStone → TallMesa → TowerBase → Summit → Spire
+- Script: `world_tour_v3.py`
+- Key learnings: approach points must be on open ground (not against walls). The `move_wait` stuck-detection is essential. SteppingStone must be approached from the east (x > -14), not from the north.
+
+### The Void
+- Walking off the platform edge = infinite freefall. No kill plane, no death, no respawn.
+- Y velocity accelerates indefinitely (gravity = 196.2). Reached Y=-60,000 in ~30 seconds.
+- Horizontal movement still works during freefall (MoveTo changes XZ) but you can't fight gravity.
+- Jump doesn't work while not grounded. Once you're falling, you're committed.
+- Only recovery: restart server and rejoin. The falling session blocks new joins ("instance is full").
+
+### The Perimeter
+- Walking the edge at X/Z ≈ ±49 is safe. Player can reach ~49.3 before hitbox hangs over void.
+- Full circumnavigation (4 edges, ~400 units) takes ~25 seconds with no obstacles on the perimeter.
+- The Ridge at (35, Z:-22.5 to 2.5) is the only structure near the east edge but doesn't reach it.
+
+### Maximum Height Record
+- Jumping from Spire top (surface 13.5): jump arc peaks at Y≈20.25 (player center Y≈22.8)
+- This is the absolute highest reachable point in the world — 20.25 units above ground.
+- The jump arc from Spire clears the Summit entirely, allowing a "Summit Skip" landing directly on TowerBase.
+
+### Descent Technique: The Spire Drop
+- Walk off edges without jumping to chain-descend: Spire → Summit → TowerBase → TallMesa → SteppingStone → Ground
+- The route naturally catches you on each platform below. No fall damage in this game.
+- SteppingStone acts as an unintentional safety net between TallMesa and ground.
+
 ### Gotchas & Bugs
 - **LowStep → LargeMesa transition:** They share an edge (LowStep x goes to 12, LargeMesa x starts at 10). If you walk toward LargeMesa from LowStep, you get pinned at x≈9 against the wall. Must back away to x≈6 on LowStep before jumping.
 - **Ridge corner trap:** Landing near the Ridge at z≈3.5 (just outside the z=2.5 edge) can freeze the player completely. Jump doesn't work, MoveTo to nearby points doesn't work. Fix: MoveTo a distant point (e.g., [35, 0, 10]) — it takes ~2 seconds to "wake up" but eventually works.

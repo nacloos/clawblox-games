@@ -53,7 +53,7 @@ const contextFiles = ["SOUL.md", "IDENTITY.md", "SEMANTIC_MEMORY.md"];
 for (const file of contextFiles) {
 	const dest = path.join(agentDir, file);
 	if (!existsSync(dest)) {
-		const templatePath = path.join(scriptDir, "templates", file);
+		const templatePath = path.join(scriptDir, "templates", "agent", file);
 		const template = existsSync(templatePath) ? readFileSync(templatePath, "utf8") : "";
 		writeFileSync(dest, template);
 	}
@@ -87,13 +87,16 @@ function buildSystemPrompt() {
 	const worldDir = path.join(workspaceDir, "world");
 	lines.push(
 		"## Workspace",
+		"",
 		`Your workspace is ${workspaceDir}. Only work inside this directory.`,
+		"",
 		`Your world is at ${worldDir}. You live your life in this world. Make it yours to not get bored.`,
+		"",
 		`Documentation: ${path.join(worldDir, "docs")}`,
 		"",
 	);
 
-	return lines.filter(Boolean).join("\n");
+	return lines.join("\n");
 }
 
 const debugDir = path.join(scriptDir, "debug");

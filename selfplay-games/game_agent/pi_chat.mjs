@@ -1,6 +1,6 @@
 import { Agent } from "/home/nacloos/Code/pi-mono/packages/agent/dist/index.js";
 import { getModel } from "/home/nacloos/Code/pi-mono/packages/ai/dist/index.js";
-import { createCodingTools } from "/home/nacloos/Code/pi-mono/packages/coding-agent/dist/index.js";
+import { createCodingTools, calculateContextTokens, shouldCompact } from "/home/nacloos/Code/pi-mono/packages/coding-agent/dist/index.js";
 import { createInterface } from "node:readline";
 import { stdin as input, stdout as output } from "node:process";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
@@ -88,7 +88,7 @@ function buildSystemPrompt() {
 	lines.push(
 		"## Workspace",
 		"",
-		`Your workspace is ${workspaceDir}. Only work inside this directory. Your workspace is your mind — keep it clear, don't let it get messy.`,
+		`Your workspace is ${workspaceDir}. Only work inside this directory. Your workspace is your mind — keep it clear and organized, don't let it get messy.`,
 		"",
 		`Your world is at ${worldDir}. You live your life in this world. Make it yours to not get bored.`,
 		"",
@@ -114,6 +114,9 @@ const agent = new Agent({
 	},
 	getApiKey: (provider) => (provider === "anthropic" ? apiKey : undefined),
 });
+
+let contextFlushPending = false;
+const FLUSH_PROMPT = "[SYSTEM] Context nearly full. Save anything important to your workspace files, then confirm ready.";
 
 let isBusy = false;
 let isClosing = false;
@@ -158,6 +161,22 @@ agent.subscribe((event) => {
 		}
 		output.write("\n");
 		assistantSawDelta = false;
+
+		if (event.message.usage && !contextFlushPending) {
+			const tokens = calculateContextTokens(event.message.usage);
+			const cw = agent.state.model.contextWindow;
+			if (shouldCompact(tokens, cw, { enabled: true, reserveTokens: 16384, keepRecentTokens: 0 })) {
+				contextFlushPending = true;
+				output.write("\n[context] Approaching limit. Flushing memories...\n");
+				agent.followUp({ role: "user", content: [{ type: "text", text: FLUSH_PROMPT }], timestamp: Date.now() });
+			}
+		}
+	}
+	if (event.type === "agent_end" && contextFlushPending) {
+		contextFlushPending = false;
+		agent.reset();
+		agent.setSystemPrompt(buildSystemPrompt());
+		output.write("[context] Session reset.\n");
 	}
 });
 
@@ -182,6 +201,23 @@ rl.on("line", (rawLine) => {
 	if (line === "/quit" || line === "/exit") {
 		isClosing = true;
 		rl.close();
+		return;
+	}
+	if (line === "/flush") {
+		if (isBusy) return;
+		isBusy = true;
+		contextFlushPending = true;
+		output.write("[context] Manual flush triggered.\n");
+		(async () => {
+			try {
+				await agent.prompt(FLUSH_PROMPT);
+			} catch (error) {
+				console.error("Flush error:", error instanceof Error ? error.message : error);
+			} finally {
+				isBusy = false;
+				printPrompt(rl);
+			}
+		})();
 		return;
 	}
 	if (line === "/reset") {

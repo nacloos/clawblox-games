@@ -25,8 +25,10 @@ function resolveEntityModelUrl(entity) {
 function buildSky(scene) {
   const skyMat = new THREE.ShaderMaterial({
     uniforms: {
-      topColor: { value: new THREE.Color(0x87ceeb) },
-      bottomColor: { value: new THREE.Color(0xffecd2) },
+      topColor: { value: new THREE.Color(0x1a0a2e) },      // deep purple-black
+      midColor: { value: new THREE.Color(0xff4500) },       // orange glow
+      bottomColor: { value: new THREE.Color(0xff6347) },    // lava reflection
+      lavaIntensity: { value: 0.0 },
     },
     vertexShader: `
       varying vec3 vWP;
@@ -36,17 +38,28 @@ function buildSky(scene) {
       }
     `,
     fragmentShader: `
-      uniform vec3 topColor, bottomColor;
+      uniform vec3 topColor, midColor, bottomColor;
+      uniform float lavaIntensity;
       varying vec3 vWP;
       void main(){
         float h = normalize(vWP).y;
-        gl_FragColor = vec4(mix(bottomColor, topColor, max(h, 0.0)), 1.0);
+        vec3 skyTop = mix(vec3(0.53, 0.81, 0.92), topColor, lavaIntensity);
+        vec3 skyMid = mix(vec3(1.0, 0.93, 0.82), midColor, lavaIntensity);
+        vec3 skyBot = mix(vec3(0.93, 0.87, 0.73), bottomColor, lavaIntensity);
+        vec3 col;
+        if (h > 0.3) {
+          col = mix(skyMid, skyTop, smoothstep(0.3, 0.8, h));
+        } else {
+          col = mix(skyBot, skyMid, smoothstep(-0.2, 0.3, h));
+        }
+        gl_FragColor = vec4(col, 1.0);
       }
     `,
     side: THREE.BackSide,
     depthWrite: false,
   })
   scene.add(new THREE.Mesh(new THREE.SphereGeometry(1500, 32, 32), skyMat))
+  return skyMat
 }
 
 function buildClouds(scene) {
@@ -68,7 +81,7 @@ function buildClouds(scene) {
     }
     cg.position.set(Math.random() * 500 - 250, 100 + Math.random() * 80, Math.random() * 300 - 150)
     scene.add(cg)
-    cloudList.push({ mesh: cg, speed: 0.5 + Math.random() * 1.5 })
+    cloudList.push({ mesh: cg, speed: 0.5 + Math.random() * 1.5, mat: cloudMat })
   }
 
   return cloudList
@@ -81,8 +94,122 @@ function updateClouds(clouds, dt) {
   }
 }
 
+function createLavaMaterial() {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      time: { value: 0.0 },
+      lavaColor1: { value: new THREE.Color(0xff4500) },
+      lavaColor2: { value: new THREE.Color(0xff8c00) },
+      lavaColor3: { value: new THREE.Color(0xff0000) },
+      glowColor: { value: new THREE.Color(0xffcc00) },
+    },
+    vertexShader: `
+      varying vec2 vUv;
+      varying vec3 vPos;
+      uniform float time;
+      void main() {
+        vUv = uv;
+        vPos = position;
+        // Animated wave displacement
+        vec3 p = position;
+        p.y += sin(position.x * 0.3 + time * 1.5) * 0.3;
+        p.y += sin(position.z * 0.2 + time * 0.8) * 0.4;
+        p.y += sin((position.x + position.z) * 0.15 + time * 2.0) * 0.2;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
+      }
+    `,
+    fragmentShader: `
+      uniform float time;
+      uniform vec3 lavaColor1, lavaColor2, lavaColor3, glowColor;
+      varying vec2 vUv;
+      varying vec3 vPos;
+
+      // Simple noise
+      float hash(vec2 p) {
+        return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+      }
+      float noise(vec2 p) {
+        vec2 i = floor(p);
+        vec2 f = fract(p);
+        f = f * f * (3.0 - 2.0 * f);
+        float a = hash(i);
+        float b = hash(i + vec2(1.0, 0.0));
+        float c = hash(i + vec2(0.0, 1.0));
+        float d = hash(i + vec2(1.0, 1.0));
+        return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+      }
+      float fbm(vec2 p) {
+        float v = 0.0;
+        v += noise(p * 1.0) * 0.5;
+        v += noise(p * 2.0 + time * 0.3) * 0.25;
+        v += noise(p * 4.0 - time * 0.5) * 0.125;
+        return v;
+      }
+
+      void main() {
+        vec2 uv = vPos.xz * 0.05;
+        float n1 = fbm(uv + time * 0.1);
+        float n2 = fbm(uv * 1.5 - time * 0.15);
+
+        vec3 col = mix(lavaColor1, lavaColor2, n1);
+        col = mix(col, lavaColor3, n2 * 0.5);
+
+        // Hot spots / bright cracks
+        float crack = smoothstep(0.55, 0.7, n1 + n2 * 0.3);
+        col = mix(col, glowColor, crack * 0.8);
+
+        // Pulsing glow
+        float pulse = sin(time * 3.0) * 0.1 + 0.9;
+        col *= pulse;
+
+        // Emissive glow at edges
+        float edge = smoothstep(0.0, 0.3, n1);
+        float alpha = 0.85 + edge * 0.15;
+
+        gl_FragColor = vec4(col, alpha);
+      }
+    `,
+    transparent: true,
+    side: THREE.DoubleSide,
+  })
+}
+
+function createCoinVisual() {
+  const group = new THREE.Group()
+
+  // Main coin body - golden torus-like shape
+  const coinGeo = new THREE.CylinderGeometry(0.8, 0.8, 0.2, 16)
+  const coinMat = new THREE.MeshStandardMaterial({
+    color: 0xffd700,
+    metalness: 0.9,
+    roughness: 0.1,
+    emissive: 0xffa500,
+    emissiveIntensity: 0.4,
+  })
+  const coinMesh = new THREE.Mesh(coinGeo, coinMat)
+  coinMesh.rotation.z = Math.PI / 2  // stand upright
+  coinMesh.castShadow = true
+  group.add(coinMesh)
+
+  // Glow ring
+  const ringGeo = new THREE.TorusGeometry(0.9, 0.05, 8, 32)
+  const ringMat = new THREE.MeshStandardMaterial({
+    color: 0xffff00,
+    emissive: 0xffcc00,
+    emissiveIntensity: 1.0,
+    transparent: true,
+    opacity: 0.6,
+  })
+  const ring = new THREE.Mesh(ringGeo, ringMat)
+  group.add(ring)
+
+  return group
+}
+
 function createEntityVisual(entity) {
-  const role = (entity.render && entity.render.role) || entity.name || ''
+  const role = (entity.render && entity.render.role) || 
+               (entity.attributes && entity.attributes.RenderRole) || 
+               entity.name || ''
   const size = entity.size || [1, 1, 1]
   const modelUrl = resolveEntityModelUrl(entity)
 
@@ -100,6 +227,73 @@ function createEntityVisual(entity) {
     fallback.scale.setScalar(scale)
     root.add(fallback)
     return root
+  }
+
+  if (role === 'Lava') {
+    const group = new THREE.Group()
+    group.userData.isLava = true
+    const lavaMat = createLavaMaterial()
+    group.userData.lavaMaterial = lavaMat
+    const lavaGeo = new THREE.PlaneGeometry(200, 200, 64, 64)
+    const lavaMesh = new THREE.Mesh(lavaGeo, lavaMat)
+    lavaMesh.rotation.x = -Math.PI / 2
+    lavaMesh.position.y = 0.5 // slightly above the Part center
+    group.add(lavaMesh)
+
+    // Lava point light for that ambient glow
+    const lavaLight = new THREE.PointLight(0xff4500, 2, 80)
+    lavaLight.position.y = 2
+    group.add(lavaLight)
+    group.userData.lavaLight = lavaLight
+
+    return group
+  }
+
+  if (role === 'Coin') {
+    const group = createCoinVisual()
+    group.userData.isCoin = true
+    group.userData.spinOffset = Math.random() * Math.PI * 2
+    return group
+  }
+
+  if (role === 'DangerCoin') {
+    const group = new THREE.Group()
+    group.userData.isCoin = true
+    group.userData.isDangerCoin = true
+    group.userData.spinOffset = Math.random() * Math.PI * 2
+
+    // Bigger, redder coin
+    const coinGeo = new THREE.CylinderGeometry(1.2, 1.2, 0.3, 16)
+    const coinMat = new THREE.MeshStandardMaterial({
+      color: 0xff3333,
+      metalness: 0.9,
+      roughness: 0.1,
+      emissive: 0xff0000,
+      emissiveIntensity: 0.8,
+    })
+    const coinMesh = new THREE.Mesh(coinGeo, coinMat)
+    coinMesh.rotation.z = Math.PI / 2
+    coinMesh.castShadow = true
+    group.add(coinMesh)
+
+    // Pulsing red glow
+    const glowGeo = new THREE.SphereGeometry(1.5, 16, 16)
+    const glowMat = new THREE.MeshStandardMaterial({
+      color: 0xff0000,
+      emissive: 0xff4444,
+      emissiveIntensity: 1.5,
+      transparent: true,
+      opacity: 0.3,
+    })
+    const glow = new THREE.Mesh(glowGeo, glowMat)
+    group.add(glow)
+    group.userData.glowMesh = glow
+
+    // Red point light
+    const light = new THREE.PointLight(0xff0000, 3, 15)
+    group.add(light)
+
+    return group
   }
 
   if (role === 'Ground') {
@@ -140,7 +334,7 @@ function createEntityVisual(entity) {
     return group
   }
 
-  // Default: box with entity color
+  // Default fallback
   const color = entity.render && entity.render.color
     ? (Math.round(entity.render.color[0] * 255) << 16) |
       (Math.round(entity.render.color[1] * 255) << 8) |
@@ -161,7 +355,6 @@ function createEntityVisual(entity) {
 
 export function createRenderer(ctx) {
   const scene = new THREE.Scene()
-
   const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 3000)
 
   const renderer = new THREE.WebGLRenderer({ canvas: ctx.canvas, antialias: true })
@@ -171,9 +364,11 @@ export function createRenderer(ctx) {
   renderer.toneMappingExposure = 1.2
   renderer.outputColorSpace = THREE.SRGBColorSpace
 
-  // Lights (matching fall-guys)
-  scene.add(new THREE.AmbientLight(0xffffff, 0.6))
-  scene.add(new THREE.HemisphereLight(0x87ceeb, 0x98fb98, 0.4))
+  // Lights
+  const ambientLight = new THREE.AmbientLight(0xffffff, 0.6)
+  scene.add(ambientLight)
+  const hemiLight = new THREE.HemisphereLight(0x87ceeb, 0x98fb98, 0.4)
+  scene.add(hemiLight)
 
   const dirLight = new THREE.DirectionalLight(0xffffff, 1.2)
   dirLight.position.set(30, 50, 20)
@@ -189,8 +384,8 @@ export function createRenderer(ctx) {
   scene.add(dirLight)
   scene.add(dirLight.target)
 
-  // Sky and clouds
-  buildSky(scene)
+  // Sky
+  const skyMat = buildSky(scene)
   const clouds = buildClouds(scene)
 
   const stateBuffer = ctx.runtime.state.createSnapshotBuffer({ maxSnapshots: 8, interpolationDelayMs: 100 })
@@ -205,6 +400,8 @@ export function createRenderer(ctx) {
   let camPos = new THREE.Vector3(0, 15, -20)
   let camTarget = new THREE.Vector3(0, 2, 0)
   const clock = new THREE.Clock()
+  let totalTime = 0
+  let currentLavaY = -1
 
   function updateCamera() {
     const tp = followTargetPos
@@ -215,6 +412,44 @@ export function createRenderer(ctx) {
     camera.lookAt(camTarget)
     dirLight.position.set(tp.x + 30, 50, tp.z + 20)
     dirLight.target.position.copy(tp)
+  }
+
+  function updateLavaEffects() {
+    // Lava intensity for sky/lighting (0 = no lava visible, 1 = lava everywhere)
+    const intensity = Math.min(1, Math.max(0, currentLavaY / 14))
+
+    // Sky darkens as lava rises
+    skyMat.uniforms.lavaIntensity.value = intensity
+
+    // Ambient light shifts to orange/red
+    ambientLight.color.lerpColors(
+      new THREE.Color(0xffffff),
+      new THREE.Color(0xff8844),
+      intensity * 0.5,
+    )
+    ambientLight.intensity = 0.6 - intensity * 0.2
+
+    // Hemisphere light shifts
+    hemiLight.color.lerpColors(
+      new THREE.Color(0x87ceeb),
+      new THREE.Color(0xff4500),
+      intensity * 0.6,
+    )
+    hemiLight.groundColor.lerpColors(
+      new THREE.Color(0x98fb98),
+      new THREE.Color(0xff6600),
+      intensity * 0.8,
+    )
+
+    // Cloud tint toward ashy/dark
+    for (const c of clouds) {
+      c.mat.color.lerpColors(
+        new THREE.Color(0xffffff),
+        new THREE.Color(0x555555),
+        intensity * 0.7,
+      )
+      c.mat.opacity = 0.8 - intensity * 0.3
+    }
   }
 
   function updateScene(obs, dt) {
@@ -238,6 +473,40 @@ export function createRenderer(ctx) {
       obj.position.set(entity.position[0], entity.position[1], entity.position[2])
       if (entity.rotation) obj.quaternion.copy(rotationToQuaternion(entity.rotation))
       obj.visible = !(entity.render && entity.render.visible === false)
+
+      // Track lava Y from the lava entity
+      if (obj.userData.isLava) {
+        currentLavaY = entity.position[1]
+        // Update lava shader time
+        if (obj.userData.lavaMaterial) {
+          obj.userData.lavaMaterial.uniforms.time.value = totalTime
+        }
+        // Update lava light intensity based on height
+        if (obj.userData.lavaLight) {
+          obj.userData.lavaLight.intensity = 2 + Math.sin(totalTime * 2) * 0.5
+          obj.userData.lavaLight.position.y = 2
+        }
+      }
+
+      // Spin coins
+      if (obj.userData.isCoin) {
+        const spinSpeed = obj.userData.isDangerCoin ? 4.0 : 2.0
+        obj.rotation.y = totalTime * spinSpeed + (obj.userData.spinOffset || 0)
+        
+        if (obj.userData.isDangerCoin) {
+          // Aggressive pulsing for danger coins
+          const pulse = 1.0 + Math.sin(totalTime * 5) * 0.25
+          obj.scale.setScalar(pulse)
+          // Glow pulsing
+          if (obj.userData.glowMesh) {
+            obj.userData.glowMesh.material.opacity = 0.2 + Math.sin(totalTime * 4) * 0.15
+          }
+        } else {
+          // Gentle scale pulse for normal coins
+          const pulse = 1.0 + Math.sin(totalTime * 3 + (obj.userData.spinOffset || 0)) * 0.1
+          obj.scale.setScalar(pulse)
+        }
+      }
 
       const prev = obj.userData.prevPos
       let speed = 0
@@ -293,8 +562,11 @@ export function createRenderer(ctx) {
       stateBuffer.push(state)
       const obs = stateBuffer.interpolated() || state
       const dt = Math.min(clock.getDelta(), 0.05)
+      totalTime += dt
+      
       updateClouds(clouds, dt)
       updateScene(obs, dt)
+      updateLavaEffects()
       updateCamera()
       renderer.render(scene, camera)
     },

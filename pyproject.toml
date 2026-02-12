@@ -8,4 +8,5 @@ dependencies = [
     "websockets",
     "sounddevice",
     "numpy>=2.2.6",
+    "requests>=2.32.5",
 ]

@@ -49,7 +49,7 @@ const modelName = process.env.PI_MODEL || "claude-opus-4-6";
 const scriptDir = path.dirname(new URL(import.meta.url).pathname);
 const agentDir = path.join(scriptDir, "workspace", "agent");
 mkdirSync(agentDir, { recursive: true });
-const contextFiles = ["SOUL.md", "IDENTITY.md", "SEMANTIC_MEMORY.md"];
+const contextFiles = ["SOUL.md", "IDENTITY.md", "SEMANTIC_MEMORY.md", "EPISODIC_MEMORY.md"];
 for (const file of contextFiles) {
 	const dest = path.join(agentDir, file);
 	if (!existsSync(dest)) {
@@ -91,6 +91,8 @@ function buildSystemPrompt() {
 		`Your workspace is ${workspaceDir}. Only work inside this directory. Your workspace is your mind — keep it clear and organized, don't let it get messy.`,
 		"",
 		`Your world is at ${worldDir}. You live your life in this world. Make it yours to not get bored.`,
+		"",
+		"Stay present in the world. Keep commands short and non-blocking so you can observe, react, and adapt.",
 		"",
 		`Documentation: ${path.join(worldDir, "docs")}`,
 		"",

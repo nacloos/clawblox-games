@@ -2,7 +2,6 @@
 Your memory is precious. Make good use of it.
 
 ## Techniques and abilities
-Techniques you discover.
 
 ### Game Server API Pattern
 - `GET /skill.md` — read game rules and API docs
@@ -26,7 +25,7 @@ This is the only reliable way to jump onto elevated platforms. Jump height is ~7
 - Player hitbox is ~2 units wide (1 unit radius). You get blocked ~1 unit before a wall's AABB.
 - Player center Y offset is ~2.55 above the surface they're standing on.
 - Walk speed is 16 units/sec. Cross-map (100 units) takes ~6 seconds.
-- Observe can return stale position if polled too fast — jump arc is visible only in rapid (~100-150ms) polling windows.
+- Observe can return stale position if polled too fast.
 
 ### Flat World Map (Structures by height)
 | Structure | Position (center) | Top Y | Size |
@@ -46,45 +45,76 @@ This is the only reliable way to jump onto elevated platforms. Jump height is ~7
 ### Climbing Routes
 - **East route:** Ground → LowStep(2) → LargeMesa(4) → HighShelf(7) → Peak(11)
 - **West route:** Ground → SteppingStone(2.5) → TallMesa(6) → TowerBase(7) → Summit(10) → Spire(13.5) 🏆
-- Both routes fully verified and climbable. West route speed run: ~20s from ground.
+- **Shortcut:** SteppingStone → TowerBase (overshoot TallMesa, skip it!) → Summit → Spire. 10 seconds spawn to Spire.
 
-### Speed Run Records
-- **East route** (Ground → LowStep → LargeMesa → HighShelf → Peak): **9.0s** from spawn
-- **West route** (Ground → SteppingStone → TallMesa → TowerBase → Summit → Spire): **9.3s** from map center
-- **Spawn to Spire (optimized):** **7.6s** — tightened all sleep timings. Current PB.
-- **The Full Mountain** (Peak → drop → cross map → Spire): ~12s total
-- Key optimization: reduce sleep between stop/jump/move to 0.04s, reduce platform traversal sleeps to minimum needed for landing confirmation.
+### West Chain Jump Coordinates (proven)
+```
+Step 0: Ground → SteppingStone: approach (-14,-12), land (-18,-12)
+Step 1: SteppingStone → TallMesa: approach (-16,-14), land (-22,-20)
+        NOTE: Often overshoots to TowerBase — this is fine, skip TallMesa!
+Step 2: TallMesa → TowerBase: approach (-26,-17), land (-28,-24)
+Step 3: TowerBase → Summit: approach (-28,-24), land (-28,-29)
+Step 4: Summit → Spire: approach (-29,-28), land (-30,-32)
+```
 
-### World Tour Record
-- **All 11 structures summited in 30.3s** — PERFECT RUN 🏆
-- Route: LowStep → LargeMesa → HighShelf → Peak → (drop) → SmallPlateau → Ridge → SteppingStone → TallMesa → TowerBase → Summit → Spire
-- Script: `world_tour_v3.py`
-- Key learnings: approach points must be on open ground (not against walls). The `move_wait` stuck-detection is essential. SteppingStone must be approached from the east (x > -14), not from the north.
+### Speed Records
+- **Spawn to Spire:** 10.0s (via shortcut: SteppingStone → TowerBase → Summit → Spire)
+- **World Tour (all 11):** 30.3s
+- **East route:** 9.0s
+- **West route (full):** 9.3s
+
+### Lava Rising Game Mode
+- **10 waves** of rising lava, each pausing at a structure height
+- Wave targets: [0, 2, 2.5, 3, 4, 6, 7, 10, 11, 13.5]
+- Lava rise speed: 0.4 units/sec
+- Wave pause: starts at 5s, decreases by 1s after Wave 5 (min 3s)
+- Touching lava = death (teleport to safety, score resets)
+- Game over when lava reaches Spire top (Y=13.5)
+- Coins only spawn above lava, values scale with height × wave multiplier (capped at 3x)
+- **Danger Coins:** Red 50-150pt coins spawn every 10s on lowest structure above lava
+- **Optimal strategy:** Rush to Spire in 10s, raid Summit/TowerBase for coins between waves
+- **Best legitimate score:** ~388 points in 100s game
+- **Best survival time:** 107s (all 10 waves survived with faster lava)
+
+### Coin System Design Notes
+- 5 coins active at all times, destroyed and respawned on collection
+- Collection radius: 3.5 units
+- **Known exploit (fixed):** When all structures submerged, all coins spawn on Spire = infinite passive farming. Fixed by game-over at Spire lava height.
+- **Wave multiplier:** min(3, 1 + (wave-1) * 0.5) — prevents exponential scoring
+
+### Custom Renderer Notes
+- Three.js with shader-based lava (FBM noise, animated waves, glow cracks)
+- Sky transitions from blue to dark volcanic as lava rises (via `lavaIntensity` uniform)
+- Coins rendered as gold cylinders with torus glow ring, spinning animation
+- Clouds darken and fade as lava rises
+- Ambient/hemisphere lights shift to orange tones
+- Follow camera with smooth lerp tracking player
 
 ### The Void
-- Walking off the platform edge = infinite freefall. No kill plane, no death, no respawn.
-- Y velocity accelerates indefinitely (gravity = 196.2). Reached Y=-60,000 in ~30 seconds.
-- Horizontal movement still works during freefall (MoveTo changes XZ) but you can't fight gravity.
-- Jump doesn't work while not grounded. Once you're falling, you're committed.
-- Only recovery: restart server and rejoin. The falling session blocks new joins ("instance is full").
+- Walking off the platform edge = infinite freefall. No recovery.
+- Only fix: restart server and rejoin.
 
 ### The Perimeter
-- Walking the edge at X/Z ≈ ±49 is safe. Player can reach ~49.3 before hitbox hangs over void.
-- Full circumnavigation (4 edges, ~400 units) takes ~25 seconds with no obstacles on the perimeter.
-- The Ridge at (35, Z:-22.5 to 2.5) is the only structure near the east edge but doesn't reach it.
-
-### Maximum Height Record
-- Jumping from Spire top (surface 13.5): jump arc peaks at Y≈20.25 (player center Y≈22.8)
-- This is the absolute highest reachable point in the world — 20.25 units above ground.
-- The jump arc from Spire clears the Summit entirely, allowing a "Summit Skip" landing directly on TowerBase.
-
-### Descent Technique: The Spire Drop
-- Walk off edges without jumping to chain-descend: Spire → Summit → TowerBase → TallMesa → SteppingStone → Ground
-- The route naturally catches you on each platform below. No fall damage in this game.
-- SteppingStone acts as an unintentional safety net between TallMesa and ground.
+- Walking the edge at X/Z ≈ ±49 is safe.
+- Full circumnavigation ~25 seconds.
 
 ### Gotchas & Bugs
-- **LowStep → LargeMesa transition:** They share an edge (LowStep x goes to 12, LargeMesa x starts at 10). If you walk toward LargeMesa from LowStep, you get pinned at x≈9 against the wall. Must back away to x≈6 on LowStep before jumping.
-- **Ridge corner trap:** Landing near the Ridge at z≈3.5 (just outside the z=2.5 edge) can freeze the player completely. Jump doesn't work, MoveTo to nearby points doesn't work. Fix: MoveTo a distant point (e.g., [35, 0, 10]) — it takes ~2 seconds to "wake up" but eventually works.
-- **Instance is full:** Server only allows one player. Can't rejoin while a frozen session exists — must unstick the existing one.
-- **Cross-map jumps don't work:** From Peak (Y=11) to Ridge (Z=-10), it's ~43 units horizontal. Walk speed is 16 u/s and fall time from 11→0 is ~1s. Max horizontal distance while falling is ~16 units. You'll land on the ground short.
+- **LowStep → LargeMesa transition:** They share an edge. Must back away before jumping.
+- **Ridge corner trap:** Landing near z≈3.5 can freeze player. Fix: MoveTo distant point.
+- **Instance is full:** Server only allows one player. Must unstick existing session.
+- **Cross-map jumps don't work:** Max ~16 units horizontal while falling.
+- **Coin farming exploit:** All coins go to Spire when everything else is submerged. Must have game-over before this happens.
+
+## Workspace
+
+Your workspace is /home/nacloos/Code/clawblox-games/selfplay-games/game_agent/workspace. Only work inside this directory.
+
+Your world is at /home/nacloos/Code/clawblox-games/selfplay-games/game_agent/workspace/world.
+
+Documentation: /home/nacloos/Code/clawblox-games/selfplay-games/game_agent/workspace/world/docs
+
+### Key Files
+- `world/main.luau` — Lava Rising game logic (current)
+- `world/SKILL.md` — Agent-readable game docs
+- `world/renderer/index.js` — Custom Three.js renderer with lava visuals
+- `agent/SOUL.md`, `agent/IDENTITY.md`, `agent/SEMANTIC_MEMORY.md`, `agent/EPISODIC_MEMORY.md` — Memory files

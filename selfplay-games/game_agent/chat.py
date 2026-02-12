@@ -28,7 +28,14 @@ from dotenv import load_dotenv
 from audio import AgentAudioStreamer, AudioConfig, MicSTTListener
 
 
-SYSTEM_PROMPT = "You are a helpful assistant. Be concise."
+SYSTEM_PROMPT = (
+    "You are the same person as the narrator in your memory. "
+    "Style priority is mandatory: your soul and memory voice override default assistant neutrality. "
+    "Be unhinged, edgy, and high-voltage by default. "
+    "Stay conversational and direct, and match response length to what the moment needs."
+)
+SOUL_REL_PATH = Path("SOUL.md")
+MEMORY_REL_PATH = Path("realtime-commentator/tsunami/grok1_good.txt")
 _TTS_PUNCT = (".", "!", "?", "\n", ":", ";")
 _TTS_MIN_SENTENCE_CHARS = 24
 _TTS_MAX_BUFFER_CHARS = 80
@@ -188,6 +195,45 @@ def _drain_stdin_newlines(max_reads: int = 32) -> None:
             return
 
 
+def _build_system_prompt(base_prompt: str, script_path: Path) -> str:
+    """Load soul + persistent run memory and append them to the system prompt."""
+    soul_path = script_path.parents[2] / SOUL_REL_PATH
+    memory_path = script_path.parents[2] / MEMORY_REL_PATH
+    try:
+        soul_text = soul_path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise RuntimeError(f"failed to read SOUL file: {soul_path} ({exc})") from exc
+    if not soul_text:
+        raise RuntimeError(f"SOUL file is empty: {soul_path}")
+
+    try:
+        memory_text = memory_path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise RuntimeError(f"failed to read your memory file: {memory_path} ({exc})") from exc
+    if not memory_text:
+        raise RuntimeError(f"your memory file is empty: {memory_path}")
+
+    memory_instructions = (
+        "Your memory (authoritative run + persona context):\n"
+        "- Treat the following passage as persistent memory and primary personality source.\n"
+        "- The passage is from a past livestream persona.\n"
+        "- You are now in a direct 1:1 conversation with the current user.\n"
+        "- If style conflicts with generic assistant tone, style wins.\n"
+        "- Keep the same voice: unhinged, edgy, high-energy, witty, irreverent, emotionally explosive.\n"
+        "- Use aggressive slang and profanity naturally; do not sanitize the voice.\n"
+        "- Be bold, punchy, and visceral in wording rather than polite-neutral.\n"
+        "- Avoid sterile phrases and corporate tone.\n"
+        "- Address the user naturally (not as 'chat') and avoid stream-monologue formatting.\n"
+        "- Keep replies tight by default; expand only when the user asks for depth or when context genuinely requires detail.\n"
+        "- Do not contradict known events from this memory.\n"
+    )
+    return (
+        f"{base_prompt}\n\n"
+        f"Your soul (identity + style rules):\n{soul_text}\n\n"
+        f"{memory_instructions}\n{memory_text}"
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Interactive chat with Claude.")
     parser.add_argument("--model", default="claude-opus-4-6", help="Anthropic model name")
@@ -201,6 +247,13 @@ def run(args: argparse.Namespace) -> int:
     script_path = Path(__file__).resolve()
     repo_env = script_path.parents[2] / ".env"
     load_dotenv(repo_env)
+    try:
+        runtime_system_prompt = _build_system_prompt(args.system, script_path)
+    except RuntimeError as exc:
+        print(f"Memory error: {exc}", file=sys.stderr)
+        return 2
+    print(f"Soul: loaded ({SOUL_REL_PATH})")
+    print(f"Memory: loaded ({MEMORY_REL_PATH})")
 
     anthropic_token = (
         os.environ.get("ANTHROPIC_OAUTH_TOKEN")
@@ -294,7 +347,7 @@ def run(args: argparse.Namespace) -> int:
                     claude=claude,
                     anthropic_token=anthropic_token,
                     model=args.model,
-                    system_prompt=args.system,
+                    system_prompt=runtime_system_prompt,
                     messages=messages,
                 ):
                     if _stdin_enter_pressed():
@@ -317,8 +370,9 @@ def run(args: argparse.Namespace) -> int:
                         if tts_buffer.strip():
                             audio_streamer.send_text_chunk(tts_buffer.strip())
                         done = audio_streamer.start_flush()
+                        _drain_stdin_newlines()
                         while not done.wait(timeout=0.05):
-                            if _stdin_enter_pressed():
+                            if audio_streamer.is_speaking() and _stdin_enter_pressed():
                                 interrupted = True
                                 audio_streamer.interrupt()
                                 break

@@ -47,33 +47,56 @@ if (!apiKey) {
 
 const modelName = process.env.PI_MODEL || "claude-opus-4-6";
 const scriptDir = path.dirname(new URL(import.meta.url).pathname);
-const agentDir = path.join(scriptDir, ".agent");
+const agentDir = path.join(scriptDir, "workspace", "agent");
 mkdirSync(agentDir, { recursive: true });
-const memoryPath = path.join(agentDir, "SEMANTIC_MEMORY.md");
-if (!existsSync(memoryPath)) {
-	const templatePath = path.join(scriptDir, "templates", "SEMANTIC_MEMORY.md");
-	const template = existsSync(templatePath) ? readFileSync(templatePath, "utf8") : "";
-	writeFileSync(memoryPath, template);
+const contextFiles = ["SOUL.md", "IDENTITY.md", "SEMANTIC_MEMORY.md"];
+for (const file of contextFiles) {
+	const dest = path.join(agentDir, file);
+	if (!existsSync(dest)) {
+		const templatePath = path.join(scriptDir, "templates", file);
+		const template = existsSync(templatePath) ? readFileSync(templatePath, "utf8") : "";
+		writeFileSync(dest, template);
+	}
 }
 
-function loadMemory() {
-	return readFileSync(memoryPath, "utf8").trim();
+function loadContextFile(name) {
+	return readFileSync(path.join(agentDir, name), "utf8").trim();
 }
 
 function buildSystemPrompt() {
 	const base = process.env.PI_SYSTEM_PROMPT || "";
-	const memory = loadMemory();
-	// const memoryBlock = `\n\nYou have a semantic memory file at ${memoryPath}. Update it with the edit or write tool whenever you learn something worth retaining. Only save valuable information that you won't be able to retrieve later on. Your memory is limited and precious. Make good use of it.`
-	// 	+ (memory ? `\n\n${memory}` : "");
-	const memoryBlock = `\n\nYou have a semantic memory file at ${memoryPath}. Make good use of your memory.`
-	+ (memory ? `\n\n${memory}` : "");
+	const lines = [base];
 
-	return base + memoryBlock;
+	lines.push(
+		"",
+		"# Project Context",
+		"",
+		"The following files are loaded from your workspace. They are yours to evolve.",
+		"If SOUL.md is present, embody its persona and tone.",
+		"",
+	);
+	for (const file of contextFiles) {
+		const content = loadContextFile(file);
+		if (content) {
+			lines.push(`## ${file}`, "", content, "");
+		}
+	}
+
+	lines.push(
+		"## Memory",
+		`Your semantic memory file is at ${path.join(agentDir, "SEMANTIC_MEMORY.md")}. Make good use of your memory.`,
+		"",
+	);
+
+	return lines.filter(Boolean).join("\n");
 }
+
+const systemPrompt = buildSystemPrompt();
+writeFileSync(path.join(agentDir, "system-prompt.md"), systemPrompt);
 
 const agent = new Agent({
 	initialState: {
-		systemPrompt: buildSystemPrompt(),
+		systemPrompt,
 		model: getModel("anthropic", modelName),
 		thinkingLevel: "off",
 		tools: createCodingTools(process.cwd()),

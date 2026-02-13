@@ -37,6 +37,64 @@ function loadDotEnvFromCwdAndParents(maxLevels = 4) {
 	}
 }
 
+function deepDiff(prev, curr) {
+	if (prev === curr) return undefined;
+	if (prev == null || curr == null || typeof prev !== typeof curr) return curr;
+	if (typeof curr !== "object") return prev === curr ? undefined : curr;
+	if (Array.isArray(curr)) {
+		return JSON.stringify(prev) === JSON.stringify(curr) ? undefined : curr;
+	}
+	const result = {};
+	for (const key of new Set([...Object.keys(prev), ...Object.keys(curr)])) {
+		if (!(key in curr)) { result[key] = null; continue; }
+		if (!(key in prev)) { result[key] = curr[key]; continue; }
+		const d = deepDiff(prev[key], curr[key]);
+		if (d !== undefined) result[key] = d;
+	}
+	return Object.keys(result).length > 0 ? result : undefined;
+}
+
+function diffEntityArrays(prev, curr) {
+	const prevMap = new Map();
+	for (const e of prev) prevMap.set(e.id, JSON.stringify(e));
+	const currMap = new Map();
+	for (const e of curr) currMap.set(e.id, JSON.stringify(e));
+	const changed = [];
+	const added = [];
+	const removed = [];
+	for (const e of curr) {
+		const prevStr = prevMap.get(e.id);
+		if (prevStr == null) { added.push(e); continue; }
+		if (prevStr !== JSON.stringify(e)) changed.push(e);
+	}
+	for (const id of prevMap.keys()) {
+		if (!currMap.has(id)) removed.push(id);
+	}
+	if (changed.length === 0 && added.length === 0 && removed.length === 0) return undefined;
+	const result = {};
+	if (changed.length > 0) result.changed = changed;
+	if (added.length > 0) result.added = added;
+	if (removed.length > 0) result.removed = removed;
+	return result;
+}
+
+function diffObservation(prev, curr) {
+	if (!prev) return curr;
+	const diff = { tick: curr.tick, game_status: curr.game_status, events: curr.events || [] };
+	const playerDiff = deepDiff(prev.player, curr.player);
+	if (playerDiff) diff.player = playerDiff;
+	const otherDiff = deepDiff(prev.other_players, curr.other_players);
+	if (otherDiff) diff.other_players = otherDiff;
+	if (prev.world?.entities && curr.world?.entities) {
+		const entDiff = diffEntityArrays(prev.world.entities, curr.world.entities);
+		if (entDiff) diff.world = { entities: entDiff };
+	} else {
+		const worldDiff = deepDiff(prev.world, curr.world);
+		if (worldDiff) diff.world = worldDiff;
+	}
+	return diff;
+}
+
 function extractSpeakSegments(text) {
 	const out = [];
 	const re = /<(?:speak|s)>([\s\S]*?)<\/(?:speak|s)>/g;
@@ -378,6 +436,7 @@ let worldAgentId = "";
 let observeLoopEnabled = true;
 let observeTimer = null;
 let observeTick = 0;
+let lastObservation = null;
 
 async function joinWorldOrThrow() {
 	let lastErr = null;
@@ -618,11 +677,14 @@ function injectObserveForSpeech(observation) {
 		timestamp: Date.now(),
 	});
 
+	const diff = diffObservation(lastObservation, observation);
+	lastObservation = observation;
+
 	speechAgent.steer({
 		role: "toolResult",
 		toolCallId,
 		toolName: "act_in_world",
-		content: [{ type: "text", text: JSON.stringify({ ok: true, observation }) }],
+		content: [{ type: "text", text: JSON.stringify({ ok: true, observation: diff }) }],
 		details: {},
 		isError: false,
 		timestamp: Date.now(),
@@ -724,6 +786,7 @@ async function handleCommand(line) {
 		actionAgent.reset();
 		speechAgent.setSystemPrompt(speechSystemPrompt);
 		actionAgent.setSystemPrompt(buildActionSystemPrompt());
+		lastObservation = null;
 		addSpeechLine("Context cleared.");
 		return;
 	}

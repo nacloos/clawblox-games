@@ -458,11 +458,9 @@ async function joinWorldOrThrow() {
 	throw new Error(`Failed to join world at ${worldBaseUrl}: ${lastErr instanceof Error ? lastErr.message : String(lastErr)}`);
 }
 
-function buildActionSystemPrompt() {
-	const base = process.env.PI_ACTION_SYSTEM_PROMPT || process.env.PI_SYSTEM_PROMPT || "";
-	const lines = [base];
+function buildWorkspaceContext() {
+	const lines = [];
 	lines.push(
-		"",
 		"# Project Context",
 		"",
 		"The following files are loaded from your workspace. They are yours to evolve.",
@@ -478,6 +476,17 @@ function buildActionSystemPrompt() {
 		"## Workspace",
 		"",
 		`Your workspace is ${agentDir}. Only work inside this directory.`,
+		`Be polite and avoid working on your memory files when interacting with someone else.`
+	);
+	return lines.join("\n");
+}
+
+function buildActionSystemPrompt() {
+	const base = process.env.PI_ACTION_SYSTEM_PROMPT || process.env.PI_SYSTEM_PROMPT || "";
+	const lines = [
+		base,
+		"",
+		buildWorkspaceContext(),
 		"",
 		"## Live Game Session",
 		"",
@@ -489,21 +498,19 @@ function buildActionSystemPrompt() {
 		"Use bash/curl to do this yourself when needed.",
 		"",
 		"You are already joined. Use this session key in bash/curl calls to play immediately.",
-		"Always include header: X-Session: <session key> for /observe and /input."
-	);
+		"Always include header: X-Session: <session key> for /observe and /input.",
+	];
 	return lines.join("\n");
 }
 
 await joinWorldOrThrow();
 
-const speechBase = process.env.PI_SPEECH_SYSTEM_PROMPT || process.env.PI_SYSTEM_PROMPT || "You are a speech agent in a game world.";
 const speechSystemPrompt = [
-	speechBase,
+	"You are a being living in your world.",
+	"You can speak out loud using <speak>...</speak>. Use <silence></silence> to say nothing.",
+	// "If you don't have anything to say, just say nothing using <silence></silence>.",
 	"",
-	// "You receive world updates as assistant tool calls named act_in_world with matching tool results.",
-	// "Treat those as your own recent actions and observations.",
-	"If you don't have anything to say, just say nothing using <silence></silence>.",
-	"Use <speak>...</speak> for text that should be spoken out loud.",
+	buildWorkspaceContext(),
 ].join("\n");
 const actionSystemPrompt = buildActionSystemPrompt();
 
@@ -691,6 +698,31 @@ function injectObserveForSpeech(observation) {
 	});
 }
 
+function injectActionForSpeech(assistantMessage, toolResults) {
+	speechAgent.steer({
+		role: "assistant",
+		content: assistantMessage.content,
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		stopReason: assistantMessage.stopReason,
+		timestamp: Date.now(),
+	});
+
+	for (const result of toolResults) {
+		speechAgent.steer({
+			role: "toolResult",
+			toolCallId: result.toolCallId,
+			toolName: result.toolName,
+			content: result.content,
+			details: result.details ?? {},
+			isError: result.isError,
+			timestamp: Date.now(),
+		});
+	}
+}
+
 function stopObserveLoop() {
 	if (observeTimer) clearInterval(observeTimer);
 	observeTimer = null;
@@ -766,6 +798,10 @@ actionAgent.subscribe((event) => {
 		state.actionLiveLine = "";
 		state.actionPinnedUser = "";
 		tui.requestRender();
+	}
+	if (event.type === "turn_end" && event.toolResults.length > 0) {
+		injectActionForSpeech(event.message, event.toolResults);
+		if (!state.speechBusy && speechAgent.state.messages.length > 0) void runSpeechContinue();
 	}
 });
 
@@ -920,6 +956,6 @@ if (audioPlayer) {
 	addSpeechLine("ElevenLabs audio disabled (set ELEVENLABS_API_KEY + AGENT_A_VOICE_ID/AGENT_VOICE_ID).");
 }
 
-startObserveLoop();
+// startObserveLoop();  // Disabled: speech agent now receives observations via action agent tool call injection
 
 tui.start();

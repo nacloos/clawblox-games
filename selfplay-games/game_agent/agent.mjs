@@ -527,7 +527,8 @@ function buildActionSystemPrompt() {
 		"",
 		"Concise and first-person descriptions (max 1-2 sentences).",
 		"Focus on game-relevant interactions.",
-		"Do not describe internal file operations, curl commands, or technical details.",
+		"Do not describe internal file operations, curl commands, or technical details like coordinates.",
+		"Don't leave long gaps without a step update.",
 		"",
 		"Important: Don't write write any description or summary outside of the <step> tags to minimize token usage!",
 		"If you described something in action/observation, don't repeat it.",
@@ -553,14 +554,17 @@ await joinWorldOrThrow();
 
 const speechSystemPrompt = [
 	"You are a being living in your world.",
-	"You can speak out loud using <speak>...</speak>. Use <silence></silence> to say nothing.",
+	"Always use the tags <speak>...</speak> to speak out loud. No one will hear what you say outside of these tags.",
+	// "Use <silence></silence> to say nothing.",
 	"If SOUL.md is present, embody its persona and tone when speaking.",
 	"Max 1-2 sentences in speak tags.",
 	"",
-	"You will receive act_in_world tool results describing actions you are taking and things",
-	"you observe in the world. React only if something is worth reacting to.",
-	"You can express intent using <intent>...</intent> to guide your actions in the world.",
+	"You will receive act_in_world tool results describing actions and observations in the world",
+	// "you observe in the world. React only if something is worth reacting to.",
+	"You can express intent using <intent>...</intent> to guide your actions in the world (max 1 sentence).",
 	"Do not try to call act_in_world yourself, it is provided automatically.",
+	"",
+	"If you are struggling or you're just too dumb to do something, keep it entertaining and fun haha. Be a bit silly and crazy, even edgy and unhinged.",
 	"",
 	buildWorkspaceContext(),
 ].join("\n");
@@ -625,7 +629,7 @@ const state = {
 
 let isClosing = false;
 let actionSawDelta = false;
-let actionActivityBuffer = [];
+let actionStreamText = "";
 let speechIntentBuffer = [];
 
 const elevenLabsApiKey = process.env.ELEVENLABS_API_KEY || "";
@@ -886,6 +890,7 @@ actionAgent.subscribe((event) => {
 	persistActionConversation();
 	if (event.type === "message_start" && event.message.role === "assistant") {
 		actionSawDelta = false;
+		actionStreamText = "";
 		state.actionLiveLine = "assistant>";
 		tui.requestRender();
 		return;
@@ -893,6 +898,16 @@ actionAgent.subscribe((event) => {
 	if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
 		actionSawDelta = true;
 		state.actionLiveLine += event.assistantMessageEvent.delta;
+		actionStreamText += event.assistantMessageEvent.delta;
+
+		// Extract any complete <step> tags from the stream so far
+		const activities = extractActivities(actionStreamText);
+		if (activities.length > 0) {
+			actionStreamText = actionStreamText.replace(/<step>[\s\S]*?<\/step>/g, "");
+			injectActionForSpeech(activities);
+			if (!state.speechBusy) void runSpeechContinue();
+		}
+
 		tui.requestRender();
 		return;
 	}
@@ -903,18 +918,9 @@ actionAgent.subscribe((event) => {
 	if (event.type === "message_end" && event.message.role === "assistant") {
 		const txt = event.message.content.filter((c) => c.type === "text").map((c) => c.text).join("").trim();
 		if (txt) addActionLine(`assistant> ${txt}`);
-		const activities = extractActivities(txt);
-		if (activities.length > 0) actionActivityBuffer.push(...activities);
 		state.actionLiveLine = "";
 		state.actionPinnedUser = "";
 		tui.requestRender();
-	}
-	if (event.type === "turn_end") {
-		if (actionActivityBuffer.length > 0) {
-			const activities = actionActivityBuffer.splice(0);
-			injectActionForSpeech(activities);
-			if (!state.speechBusy) void runSpeechContinue();
-		}
 	}
 });
 
@@ -936,7 +942,7 @@ async function handleCommand(line) {
 		speechAgent.setSystemPrompt(speechSystemPrompt);
 		actionAgent.setSystemPrompt(buildActionSystemPrompt());
 		lastObservation = null;
-		actionActivityBuffer = [];
+		actionStreamText = "";
 		speechIntentBuffer = [];
 		addSpeechLine("Context cleared.");
 		return;

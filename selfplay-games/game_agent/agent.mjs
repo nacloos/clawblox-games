@@ -108,7 +108,7 @@ function extractSpeakSegments(text) {
 
 function extractActivities(text) {
 	const out = [];
-	const re = /<activity>([\s\S]*?)<\/activity>/g;
+	const re = /<step>([\s\S]*?)<\/step>/g;
 	let m;
 	while ((m = re.exec(text)) !== null) {
 		const block = m[1];
@@ -517,16 +517,20 @@ function buildActionSystemPrompt() {
 		"",
 		"## Describing Your Actions",
 		"",
-		"Right after each game world interaction, wrap a description using these tags:",
+		// "Right after each game world interaction, wrap a description using these tags:",
+		"Always briefly describe what you do with:",
 		"",
-		"<activity>",
+		"<step>",
 		"<action>what you did</action>",
 		"<observation>what you perceived</observation>",
-		"</activity>",
+		"</step>",
 		"",
-		"Write natural, first-person descriptions. Always pair action with observation.",
+		"Concise and first-person descriptions (max 1-2 sentences).",
 		"Focus on game-relevant interactions.",
 		"Do not describe internal file operations, curl commands, or technical details.",
+		"",
+		"Important: Don't write write any description or summary outside of the <step> tags to minimize token usage!",
+		"If you described something in action/observation, don't repeat it.",
 		"",
 		"## Live session",
 		"",
@@ -551,6 +555,7 @@ const speechSystemPrompt = [
 	"You are a being living in your world.",
 	"You can speak out loud using <speak>...</speak>. Use <silence></silence> to say nothing.",
 	"If SOUL.md is present, embody its persona and tone when speaking.",
+	"Max 1-2 sentences in speak tags.",
 	"",
 	"You will receive act_in_world tool results describing actions you are taking and things",
 	"you observe in the world. React only if something is worth reacting to.",
@@ -665,6 +670,20 @@ function persistSpeechConversation() {
 
 function persistActionConversation() {
 	writeFileSync(actionConversationPath, JSON.stringify(actionAgent.state.messages, null, 2));
+}
+
+async function runSpeechPrompt(text) {
+	if (isClosing || state.speechBusy) return;
+	state.speechBusy = true;
+	tui.requestRender();
+	try {
+		await speechAgent.prompt(text);
+	} catch (error) {
+		addSpeechLine(`[error] ${error instanceof Error ? error.message : String(error)}`);
+	} finally {
+		state.speechBusy = false;
+		tui.requestRender();
+	}
 }
 
 async function runSpeechContinue() {
@@ -894,7 +913,7 @@ actionAgent.subscribe((event) => {
 		if (actionActivityBuffer.length > 0) {
 			const activities = actionActivityBuffer.splice(0);
 			injectActionForSpeech(activities);
-			if (!state.speechBusy && speechAgent.state.messages.length > 0) void runSpeechContinue();
+			if (!state.speechBusy) void runSpeechContinue();
 		}
 	}
 });
@@ -1057,3 +1076,4 @@ if (audioPlayer) {
 tui.start();
 
 void runActionPrompt("Fetch the skill commands and observe the world.");
+void runSpeechPrompt("You have just woken up in the world.");

@@ -1,7 +1,7 @@
 import { Agent } from "/home/nacloos/Code/pi-mono/packages/agent/dist/index.js";
 import { getModel } from "/home/nacloos/Code/pi-mono/packages/ai/dist/index.js";
 import { createCodingTools } from "/home/nacloos/Code/pi-mono/packages/coding-agent/dist/index.js";
-import { ProcessTerminal, TUI, Input } from "/home/nacloos/Code/pi-mono/packages/tui/dist/index.js";
+import { ProcessTerminal, TUI, Input, truncateToWidth, visibleWidth } from "/home/nacloos/Code/pi-mono/packages/tui/dist/index.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import path from "node:path";
@@ -72,6 +72,12 @@ function singleLine(line) {
 	return String(line).replace(/\r?\n/g, " ");
 }
 
+function padOrTrimToWidth(text, width) {
+	const clipped = truncateToWidth(String(text || ""), width, "", false);
+	const w = visibleWidth(clipped);
+	return w < width ? clipped + " ".repeat(width - w) : clipped;
+}
+
 class TwoPaneLogs {
 	constructor(terminal, state) {
 		this.terminal = terminal;
@@ -102,15 +108,12 @@ class TwoPaneLogs {
 
 		const headerLeft = ` Speech (${this.state.speechBusy ? "busy" : "idle"}) `;
 		const headerRight = ` Action (${this.state.actionBusy ? "busy" : "idle"}) `;
-		const header =
-			headerLeft.padEnd(panelWidth, " ").slice(0, panelWidth) +
-			sep +
-			headerRight.padEnd(panelWidth, " ").slice(0, panelWidth);
+		const header = padOrTrimToWidth(headerLeft, panelWidth) + sep + padOrTrimToWidth(headerRight, panelWidth);
 
 		const lines = [header];
 		for (let i = 0; i < count; i++) {
-			const l = (left[i] || "").padEnd(panelWidth, " ").slice(0, panelWidth);
-			const r = (right[i] || "").padEnd(panelWidth, " ").slice(0, panelWidth);
+			const l = padOrTrimToWidth(left[i] || "", panelWidth);
+			const r = padOrTrimToWidth(right[i] || "", panelWidth);
 			lines.push(l + sep + r);
 		}
 		return lines;
@@ -374,6 +377,7 @@ let worldSession = "";
 let worldAgentId = "";
 let observeLoopEnabled = true;
 let observeTimer = null;
+let observeTick = 0;
 
 async function joinWorldOrThrow() {
 	let lastErr = null;
@@ -437,10 +441,10 @@ const speechBase = process.env.PI_SPEECH_SYSTEM_PROMPT || process.env.PI_SYSTEM_
 const speechSystemPrompt = [
 	speechBase,
 	"",
-	"You receive world updates as assistant tool calls named act_in_world with matching tool results.",
-	"Treat those as your own recent actions and observations.",
-	"If you don't observe anything important, say nothing.",
-	"Use <speak>...</speak> for text that should be spoken out loud. Take into account speaking time.",
+	// "You receive world updates as assistant tool calls named act_in_world with matching tool results.",
+	// "Treat those as your own recent actions and observations.",
+	"If you don't have anything to say, just say nothing using <silence></silence>.",
+	"Use <speak>...</speak> for text that should be spoken out loud.",
 ].join("\n");
 const actionSystemPrompt = buildActionSystemPrompt();
 
@@ -449,7 +453,7 @@ writeFileSync(actionSystemPromptPath, actionSystemPrompt);
 
 const codexAccessToken = loadCodexAccessToken(scriptDir);
 const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
-const modelProvider = process.env.PI_PROVIDER || (codexAccessToken ? "openai-codex" : "anthropic");
+const modelProvider = process.env.PI_PROVIDER || "anthropic";
 const modelName = process.env.PI_MODEL || (modelProvider === "openai-codex" ? "gpt-5.3-codex" : "claude-opus-4-6");
 const model = getModel(modelProvider, modelName);
 
@@ -548,11 +552,12 @@ function persistActionConversation() {
 	writeFileSync(actionConversationPath, JSON.stringify(actionAgent.state.messages, null, 2));
 }
 
-async function runSpeechPrompt(text) {
+async function runSpeechContinue() {
+	if (isClosing || state.speechBusy) return;
 	state.speechBusy = true;
 	tui.requestRender();
 	try {
-		await speechAgent.prompt(text);
+		await speechAgent.continue();
 	} catch (error) {
 		addSpeechLine(`[error] ${error instanceof Error ? error.message : String(error)}`);
 	} finally {
@@ -578,36 +583,49 @@ async function runActionPrompt(text) {
 	}
 }
 
-async function runActionContinue() {
-	if (isClosing || state.actionBusy) return;
-	state.actionBusy = true;
-	actionSawDelta = false;
-	state.actionLiveLine = "";
-	tui.requestRender();
-	try {
-		await actionAgent.continue();
-	} catch (error) {
-		addActionLine(`[error] ${error instanceof Error ? error.message : String(error)}`);
-	} finally {
-		state.actionBusy = false;
-		state.actionLiveLine = "";
-		tui.requestRender();
-	}
-}
-
-function queueObserveForAction(observation) {
-	actionAgent.steer({
-		role: "user",
-		content: [{ type: "text", text: `[observe] ${JSON.stringify(observation)}` }],
-		timestamp: Date.now(),
-	});
-}
-
 async function fetchObserve() {
 	if (!worldSession) return null;
 	return await fetchJson(`${worldBaseUrl}/observe`, {
 		method: "GET",
 		headers: { "X-Session": worldSession },
+	});
+}
+
+function injectObserveForSpeech(observation) {
+	observeTick += 1;
+	const toolCallId = `bridge_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+	const action = {
+		type: "Observe",
+		data: {
+			tick: observation?.tick ?? observeTick,
+		},
+	};
+	speechAgent.steer({
+		role: "assistant",
+		content: [{ type: "toolCall", id: toolCallId, name: "act_in_world", arguments: { action } }],
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "toolUse",
+		timestamp: Date.now(),
+	});
+
+	speechAgent.steer({
+		role: "toolResult",
+		toolCallId,
+		toolName: "act_in_world",
+		content: [{ type: "text", text: JSON.stringify({ ok: true, observation }) }],
+		details: {},
+		isError: false,
+		timestamp: Date.now(),
 	});
 }
 
@@ -624,10 +642,10 @@ function startObserveLoop() {
 		try {
 			const obs = await fetchObserve();
 			if (!obs) return;
-			queueObserveForAction(obs);
-			if (!state.actionBusy) void runActionContinue();
+			injectObserveForSpeech(obs);
+			if (!state.speechBusy && speechAgent.state.messages.length > 0) void runSpeechContinue();
 		} catch (error) {
-			addActionLine(`[observe] error: ${error instanceof Error ? error.message : String(error)}`);
+			addSpeechLine(`[observe] error: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}, Math.max(250, observeIntervalMs));
 }
@@ -714,30 +732,30 @@ async function handleCommand(line) {
 		return;
 	}
 	if (line === "/observe status") {
-		addActionLine(`observe=${observeLoopEnabled ? "on" : "off"} interval=${observeIntervalMs}ms session=${worldSession ? "set" : "missing"}`);
+		addSpeechLine(`observe=${observeLoopEnabled ? "on" : "off"} interval=${observeIntervalMs}ms session=${worldSession ? "set" : "missing"}`);
 		return;
 	}
 	if (line === "/observe on") {
 		if (!observeLoopEnabled) startObserveLoop();
-		addActionLine(`observe=on (${observeIntervalMs}ms)`);
+		addSpeechLine(`observe=on (${observeIntervalMs}ms)`);
 		return;
 	}
 	if (line === "/observe off") {
 		observeLoopEnabled = false;
 		stopObserveLoop();
-		addActionLine("observe=off");
+		addSpeechLine("observe=off");
 		return;
 	}
 	if (line === "/observe once") {
 		try {
 			const obs = await fetchObserve();
 			if (obs) {
-				queueObserveForAction(obs);
-				if (!state.actionBusy) void runActionContinue();
-				addActionLine("observe=once queued");
+				injectObserveForSpeech(obs);
+				if (!state.speechBusy && speechAgent.state.messages.length > 0) void runSpeechContinue();
+				addSpeechLine("observe=once queued");
 			}
 		} catch (error) {
-			addActionLine(`[observe] error: ${error instanceof Error ? error.message : String(error)}`);
+			addSpeechLine(`[observe] error: ${error instanceof Error ? error.message : String(error)}`);
 		}
 		return;
 	}
@@ -763,10 +781,17 @@ async function handleCommand(line) {
 		state.speechPinnedUser = `you> ${text}`;
 		addSpeechLine(`you> ${text}`);
 		if (state.speechBusy) {
-			addSpeechLine("Still processing previous request.");
+			speechAgent.steer({ role: "user", content: [{ type: "text", text }], timestamp: Date.now() });
+			addSpeechLine("Queued steer message.");
 			return;
 		}
-		void runSpeechPrompt(text);
+		const userMessage = { role: "user", content: [{ type: "text", text }], timestamp: Date.now() };
+		if (speechAgent.state.messages.length === 0) {
+			speechAgent.appendMessage(userMessage);
+		} else {
+			speechAgent.steer(userMessage);
+		}
+		void runSpeechContinue();
 		return;
 	}
 	if (line === "/s") {
@@ -777,13 +802,20 @@ async function handleCommand(line) {
 	if (state.speechBusy) {
 		state.speechPinnedUser = `you> ${line}`;
 		addSpeechLine(`you> ${line}`);
-		addSpeechLine("Still processing previous request.");
+		speechAgent.steer({ role: "user", content: [{ type: "text", text: line }], timestamp: Date.now() });
+		addSpeechLine("Queued steer message.");
 		return;
 	}
 
 	state.speechPinnedUser = `you> ${line}`;
 	addSpeechLine(`you> ${line}`);
-	void runSpeechPrompt(line);
+	const userMessage = { role: "user", content: [{ type: "text", text: line }], timestamp: Date.now() };
+	if (speechAgent.state.messages.length === 0) {
+		speechAgent.appendMessage(userMessage);
+	} else {
+		speechAgent.steer(userMessage);
+	}
+	void runSpeechContinue();
 }
 
 tui.addChild(split);

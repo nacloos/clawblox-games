@@ -124,6 +124,17 @@ function extractActivities(text) {
 	return out;
 }
 
+function extractIntents(text) {
+	const out = [];
+	const re = /<intent>([\s\S]*?)<\/intent>/g;
+	let m;
+	while ((m = re.exec(text)) !== null) {
+		const intent = m[1].trim();
+		if (intent) out.push(intent);
+	}
+	return out;
+}
+
 function wrapLine(line, width) {
 	if (width <= 0) return [""];
 	if (!line) return [""];
@@ -539,10 +550,11 @@ await joinWorldOrThrow();
 const speechSystemPrompt = [
 	"You are a being living in your world.",
 	"You can speak out loud using <speak>...</speak>. Use <silence></silence> to say nothing.",
+	"If SOUL.md is present, embody its persona and tone when speaking.",
 	"",
 	"You will receive act_in_world tool results describing actions you are taking and things",
-	"you observe in the world. React to these naturally, speak if something is interesting,",
-	"surprising, or worth commenting on. Use <silence></silence> if nothing warrants speaking.",
+	"you observe in the world. React only if something is worth reacting to.",
+	"You can express intent using <intent>...</intent> to guide your actions in the world.",
 	"Do not try to call act_in_world yourself, it is provided automatically.",
 	"",
 	buildWorkspaceContext(),
@@ -609,6 +621,7 @@ const state = {
 let isClosing = false;
 let actionSawDelta = false;
 let actionActivityBuffer = [];
+let speechIntentBuffer = [];
 
 const elevenLabsApiKey = process.env.ELEVENLABS_API_KEY || "";
 const elevenLabsVoiceId =
@@ -664,6 +677,23 @@ async function runSpeechContinue() {
 		addSpeechLine(`[error] ${error instanceof Error ? error.message : String(error)}`);
 	} finally {
 		state.speechBusy = false;
+		tui.requestRender();
+	}
+}
+
+async function runActionContinue() {
+	if (isClosing || state.actionBusy) return;
+	state.actionBusy = true;
+	actionSawDelta = false;
+	state.actionLiveLine = "";
+	tui.requestRender();
+	try {
+		await actionAgent.continue();
+	} catch (error) {
+		addActionLine(`[error] ${error instanceof Error ? error.message : String(error)}`);
+	} finally {
+		state.actionBusy = false;
+		state.actionLiveLine = "";
 		tui.requestRender();
 	}
 }
@@ -761,6 +791,16 @@ function injectActionForSpeech(activities) {
 	}
 }
 
+function injectSpeechForAction(intents) {
+	for (const intent of intents) {
+		actionAgent.steer({
+			role: "user",
+			content: [{ type: "text", text: intent }],
+			timestamp: Date.now(),
+		});
+	}
+}
+
 function stopObserveLoop() {
 	if (observeTimer) clearInterval(observeTimer);
 	observeTimer = null;
@@ -806,9 +846,20 @@ speechAgent.subscribe((event) => {
 			addSpeechLine(`[speak] ${seg}`);
 			audioPlayer?.enqueue(seg);
 		}
+
+		const intents = extractIntents(fullText);
+		if (intents.length > 0) speechIntentBuffer.push(...intents);
+
 		state.speechLiveLine = "";
 		state.speechPinnedUser = "";
 		tui.requestRender();
+	}
+	if (event.type === "turn_end") {
+		if (speechIntentBuffer.length > 0) {
+			const intents = speechIntentBuffer.splice(0);
+			injectSpeechForAction(intents);
+			if (!state.actionBusy) void runActionContinue();
+		}
 	}
 });
 
@@ -867,6 +918,7 @@ async function handleCommand(line) {
 		actionAgent.setSystemPrompt(buildActionSystemPrompt());
 		lastObservation = null;
 		actionActivityBuffer = [];
+		speechIntentBuffer = [];
 		addSpeechLine("Context cleared.");
 		return;
 	}
@@ -1003,3 +1055,5 @@ if (audioPlayer) {
 // startObserveLoop();  // Disabled: speech agent now receives observations via action agent tool call injection
 
 tui.start();
+
+void runActionPrompt("Fetch the skill commands and observe the world.");

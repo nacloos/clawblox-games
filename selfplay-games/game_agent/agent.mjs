@@ -106,6 +106,24 @@ function extractSpeakSegments(text) {
 	return out;
 }
 
+function extractActivities(text) {
+	const out = [];
+	const re = /<activity>([\s\S]*?)<\/activity>/g;
+	let m;
+	while ((m = re.exec(text)) !== null) {
+		const block = m[1];
+		const actionMatch = /<action>([\s\S]*?)<\/action>/.exec(block);
+		const obsMatch = /<observation>([\s\S]*?)<\/observation>/.exec(block);
+		if (actionMatch || obsMatch) {
+			out.push({
+				action: actionMatch ? actionMatch[1].trim() : "",
+				observation: obsMatch ? obsMatch[1].trim() : "",
+			});
+		}
+	}
+	return out;
+}
+
 function wrapLine(line, width) {
 	if (width <= 0) return [""];
 	if (!line) return [""];
@@ -461,6 +479,11 @@ async function joinWorldOrThrow() {
 function buildWorkspaceContext() {
 	const lines = [];
 	lines.push(
+		"## Workspace",
+		"",
+		`Your workspace is ${agentDir}. Only work inside this directory.`,
+		"Be polite and avoid working on your memory files when interacting with someone else.",
+		"",
 		"# Project Context",
 		"",
 		"The following files are loaded from your workspace. They are yours to evolve.",
@@ -472,12 +495,6 @@ function buildWorkspaceContext() {
 		const content = loadContextFile(file);
 		if (content) lines.push("---", "", `**${file}** (${filePath})`, "", content, "");
 	}
-	lines.push(
-		"## Workspace",
-		"",
-		`Your workspace is ${agentDir}. Only work inside this directory.`,
-		`Be polite and avoid working on your memory files when interacting with someone else.`
-	);
 	return lines.join("\n");
 }
 
@@ -485,10 +502,22 @@ function buildActionSystemPrompt() {
 	const base = process.env.PI_ACTION_SYSTEM_PROMPT || process.env.PI_SYSTEM_PROMPT || "";
 	const lines = [
 		base,
+		"You are a being living in your world.",
 		"",
-		buildWorkspaceContext(),
+		"## Describing Your Actions",
 		"",
-		"## Live Game Session",
+		"Right after each game world interaction, wrap a description using these tags:",
+		"",
+		"<activity>",
+		"<action>what you did</action>",
+		"<observation>what you perceived</observation>",
+		"</activity>",
+		"",
+		"Write natural, first-person descriptions. Always pair action with observation.",
+		"Focus on game-relevant interactions.",
+		"Do not describe internal file operations, curl commands, or technical details.",
+		"",
+		"## Live session",
 		"",
 		`World base URL: ${worldBaseUrl}`,
 		`Session key (X-Session): ${worldSession}`,
@@ -499,6 +528,8 @@ function buildActionSystemPrompt() {
 		"",
 		"You are already joined. Use this session key in bash/curl calls to play immediately.",
 		"Always include header: X-Session: <session key> for /observe and /input.",
+		"",
+		buildWorkspaceContext(),
 	];
 	return lines.join("\n");
 }
@@ -508,7 +539,11 @@ await joinWorldOrThrow();
 const speechSystemPrompt = [
 	"You are a being living in your world.",
 	"You can speak out loud using <speak>...</speak>. Use <silence></silence> to say nothing.",
-	// "If you don't have anything to say, just say nothing using <silence></silence>.",
+	"",
+	"You will receive act_in_world tool results describing actions you are taking and things",
+	"you observe in the world. React to these naturally, speak if something is interesting,",
+	"surprising, or worth commenting on. Use <silence></silence> if nothing warrants speaking.",
+	"Do not try to call act_in_world yourself, it is provided automatically.",
 	"",
 	buildWorkspaceContext(),
 ].join("\n");
@@ -573,6 +608,7 @@ const state = {
 
 let isClosing = false;
 let actionSawDelta = false;
+let actionActivityBuffer = [];
 
 const elevenLabsApiKey = process.env.ELEVENLABS_API_KEY || "";
 const elevenLabsVoiceId =
@@ -698,26 +734,28 @@ function injectObserveForSpeech(observation) {
 	});
 }
 
-function injectActionForSpeech(assistantMessage, toolResults) {
-	speechAgent.steer({
-		role: "assistant",
-		content: assistantMessage.content,
-		api: model.api,
-		provider: model.provider,
-		model: model.id,
-		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-		stopReason: assistantMessage.stopReason,
-		timestamp: Date.now(),
-	});
+function injectActionForSpeech(activities) {
+	for (const activity of activities) {
+		const toolCallId = `action_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
-	for (const result of toolResults) {
+		speechAgent.steer({
+			role: "assistant",
+			content: [{ type: "toolCall", id: toolCallId, name: "act_in_world", arguments: { action: activity.action } }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+			stopReason: "toolUse",
+			timestamp: Date.now(),
+		});
+
 		speechAgent.steer({
 			role: "toolResult",
-			toolCallId: result.toolCallId,
-			toolName: result.toolName,
-			content: result.content,
-			details: result.details ?? {},
-			isError: result.isError,
+			toolCallId,
+			toolName: "act_in_world",
+			content: [{ type: "text", text: JSON.stringify({ ok: true, observation: activity.observation }) }],
+			details: {},
+			isError: false,
 			timestamp: Date.now(),
 		});
 	}
@@ -795,13 +833,18 @@ actionAgent.subscribe((event) => {
 	if (event.type === "message_end" && event.message.role === "assistant") {
 		const txt = event.message.content.filter((c) => c.type === "text").map((c) => c.text).join("").trim();
 		if (txt) addActionLine(`assistant> ${txt}`);
+		const activities = extractActivities(txt);
+		if (activities.length > 0) actionActivityBuffer.push(...activities);
 		state.actionLiveLine = "";
 		state.actionPinnedUser = "";
 		tui.requestRender();
 	}
-	if (event.type === "turn_end" && event.toolResults.length > 0) {
-		injectActionForSpeech(event.message, event.toolResults);
-		if (!state.speechBusy && speechAgent.state.messages.length > 0) void runSpeechContinue();
+	if (event.type === "turn_end") {
+		if (actionActivityBuffer.length > 0) {
+			const activities = actionActivityBuffer.splice(0);
+			injectActionForSpeech(activities);
+			if (!state.speechBusy && speechAgent.state.messages.length > 0) void runSpeechContinue();
+		}
 	}
 });
 
@@ -823,6 +866,7 @@ async function handleCommand(line) {
 		speechAgent.setSystemPrompt(speechSystemPrompt);
 		actionAgent.setSystemPrompt(buildActionSystemPrompt());
 		lastObservation = null;
+		actionActivityBuffer = [];
 		addSpeechLine("Context cleared.");
 		return;
 	}

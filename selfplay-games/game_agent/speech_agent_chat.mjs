@@ -292,7 +292,6 @@ if (modelProvider === "anthropic" && !anthropicApiKey) {
 	console.error("Missing ANTHROPIC_API_KEY (set env var or add it to .env)");
 	process.exit(1);
 }
-
 const baseSystemPrompt = process.env.PI_SYSTEM_PROMPT || "You are a speech agent in a game world.";
 const systemPrompt = [
 	baseSystemPrompt,
@@ -300,7 +299,7 @@ const systemPrompt = [
 	"You receive world updates as assistant tool calls named act_in_world with matching tool results.",
 	"Treat those as your own recent actions and observations.",
 	"If you don't observe anything important, say nothing.",
-	"Use <speak>...</speak> for text that should be spoken out loud.",
+	"Use <speak>...</speak> for text that should be spoken out loud. Take into account speaking time.",
 ].join("\n");
 
 const agent = new Agent({

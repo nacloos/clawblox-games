@@ -39,14 +39,41 @@ function loadDotEnvFromCwdAndParents(maxLevels = 4) {
 
 loadDotEnvFromCwdAndParents();
 
-const apiKey = process.env.ANTHROPIC_API_KEY;
-if (!apiKey) {
+const scriptDir = path.dirname(new URL(import.meta.url).pathname);
+
+function loadCodexAccessToken() {
+	const candidates = [
+		path.join(process.cwd(), "auth.json"),
+		path.join(scriptDir, "auth.json"),
+	];
+	for (const p of candidates) {
+		if (!existsSync(p)) continue;
+		try {
+			const auth = JSON.parse(readFileSync(p, "utf8"));
+			const creds = auth?.["openai-codex"];
+			if (creds && typeof creds.access === "string" && creds.access.length > 0) {
+				return creds.access;
+			}
+		} catch {
+			// Ignore malformed auth file and continue.
+		}
+	}
+	return undefined;
+}
+
+const codexAccessToken = loadCodexAccessToken();
+const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
+const modelProvider = process.env.PI_PROVIDER || (codexAccessToken ? "openai-codex" : "anthropic");
+const modelName = process.env.PI_MODEL || (modelProvider === "openai-codex" ? "gpt-5.3-codex" : "claude-opus-4-6");
+
+if (modelProvider === "openai-codex" && !codexAccessToken) {
+	console.error("Missing Codex OAuth token. Run: npx @mariozechner/pi-ai login openai-codex");
+	process.exit(1);
+}
+if (modelProvider === "anthropic" && !anthropicApiKey) {
 	console.error("Missing ANTHROPIC_API_KEY (set env var or add it to .env)");
 	process.exit(1);
 }
-
-const modelName = process.env.PI_MODEL || "claude-opus-4-6";
-const scriptDir = path.dirname(new URL(import.meta.url).pathname);
 const agentDir = path.join(scriptDir, "workspace", "agent");
 mkdirSync(agentDir, { recursive: true });
 const contextFiles = ["SOUL.md", "IDENTITY.md", "SEMANTIC_MEMORY.md", "EPISODIC_MEMORY.md"];
@@ -79,7 +106,7 @@ function buildSystemPrompt() {
 		const filePath = path.join(agentDir, file);
 		const content = loadContextFile(file);
 		if (content) {
-			lines.push(`## ${filePath}`, "", content, "");
+			lines.push(`---`, "", `**${file}** (${filePath})`, "", content, "");
 		}
 	}
 
@@ -110,11 +137,15 @@ writeFileSync(path.join(debugDir, "system-prompt.md"), systemPrompt);
 const agent = new Agent({
 	initialState: {
 		systemPrompt,
-		model: getModel("anthropic", modelName),
+		model: getModel(modelProvider, modelName),
 		thinkingLevel: "off",
 		tools: createCodingTools(process.cwd()),
 	},
-	getApiKey: (provider) => (provider === "anthropic" ? apiKey : undefined),
+	getApiKey: (provider) => {
+		if (provider === "openai-codex") return codexAccessToken;
+		if (provider === "anthropic") return anthropicApiKey;
+		return undefined;
+	},
 });
 
 let contextFlushPending = false;

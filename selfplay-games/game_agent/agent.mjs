@@ -1,8 +1,7 @@
 import { Agent } from "/home/nacloos/Code/pi-mono/packages/agent/dist/index.js";
 import { getModel } from "/home/nacloos/Code/pi-mono/packages/ai/dist/index.js";
 import { createCodingTools } from "/home/nacloos/Code/pi-mono/packages/coding-agent/dist/index.js";
-import { createInterface } from "node:readline";
-import { stdin as input, stdout as output } from "node:process";
+import { ProcessTerminal, TUI, Input } from "/home/nacloos/Code/pi-mono/packages/tui/dist/index.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import path from "node:path";
@@ -49,6 +48,75 @@ function extractSpeakSegments(text) {
 	return out;
 }
 
+function wrapLine(line, width) {
+	if (width <= 0) return [""];
+	if (!line) return [""];
+	const out = [];
+	const logicalLines = String(line).split(/\r?\n/);
+	for (const logical of logicalLines) {
+		if (!logical) {
+			out.push("");
+			continue;
+		}
+		let s = logical;
+		while (s.length > width) {
+			out.push(s.slice(0, width));
+			s = s.slice(width);
+		}
+		out.push(s);
+	}
+	return out.length > 0 ? out : [""];
+}
+
+function singleLine(line) {
+	return String(line).replace(/\r?\n/g, " ");
+}
+
+class TwoPaneLogs {
+	constructor(terminal, state) {
+		this.terminal = terminal;
+		this.state = state;
+	}
+
+	invalidate() {}
+
+	render(width) {
+		const sep = " | ";
+		const panelWidth = Math.max(16, Math.floor((width - sep.length) / 2));
+		const rows = Math.max(8, this.terminal.rows - 4);
+
+		const leftAll = [];
+		for (const line of this.state.speechLines) leftAll.push(...wrapLine(line, panelWidth));
+		if (this.state.speechLiveLine) leftAll.push(...wrapLine(this.state.speechLiveLine, panelWidth));
+		const pinnedLeftLine = this.state.speechPinnedUser ? singleLine(this.state.speechPinnedUser) : "";
+
+		const rightAll = [];
+		for (const line of this.state.actionLines) rightAll.push(...wrapLine(line, panelWidth));
+		if (this.state.actionLiveLine) rightAll.push(...wrapLine(this.state.actionLiveLine, panelWidth));
+		const pinnedRightLine = this.state.actionPinnedUser ? singleLine(this.state.actionPinnedUser) : "";
+
+		const bodyRows = Math.max(1, rows - 1);
+		const left = [...leftAll.slice(-bodyRows), pinnedLeftLine];
+		const right = [...rightAll.slice(-bodyRows), pinnedRightLine];
+		const count = Math.max(left.length, right.length, rows);
+
+		const headerLeft = ` Speech (${this.state.speechBusy ? "busy" : "idle"}) `;
+		const headerRight = ` Action (${this.state.actionBusy ? "busy" : "idle"}) `;
+		const header =
+			headerLeft.padEnd(panelWidth, " ").slice(0, panelWidth) +
+			sep +
+			headerRight.padEnd(panelWidth, " ").slice(0, panelWidth);
+
+		const lines = [header];
+		for (let i = 0; i < count; i++) {
+			const l = (left[i] || "").padEnd(panelWidth, " ").slice(0, panelWidth);
+			const r = (right[i] || "").padEnd(panelWidth, " ").slice(0, panelWidth);
+			lines.push(l + sep + r);
+		}
+		return lines;
+	}
+}
+
 class ElevenLabsRealtimePlayer {
 	constructor({ apiKey, voiceId, modelId = "eleven_flash_v2_5", outputFormat = "pcm_16000" }) {
 		this.apiKey = apiKey;
@@ -93,9 +161,6 @@ class ElevenLabsRealtimePlayer {
 			],
 			{ stdio: ["pipe", "ignore", "ignore"] },
 		);
-		this.ffplay.once("error", (err) => {
-			output.write(`[audio] ffplay unavailable: ${err instanceof Error ? err.message : String(err)}\n`);
-		});
 	}
 
 	cleanupConnection() {
@@ -156,10 +221,6 @@ class ElevenLabsRealtimePlayer {
 				this.msgWaiter = null;
 				waiter();
 			}
-		});
-		ws.addEventListener("close", () => {
-			if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
-			this.keepaliveTimer = null;
 		});
 
 		ws.send(
@@ -236,9 +297,7 @@ class ElevenLabsRealtimePlayer {
 		const cleaned = text.trim();
 		if (!cleaned) return;
 		this.queue.push(cleaned);
-		this.processQueue().catch((err) => {
-			output.write(`[audio] playback error: ${err instanceof Error ? err.message : String(err)}\n`);
-		});
+		this.processQueue().catch(() => {});
 	}
 
 	async start() {
@@ -253,37 +312,30 @@ class ElevenLabsRealtimePlayer {
 }
 
 function loadCodexAccessToken(scriptDir) {
-	const candidates = [
-		path.join(process.cwd(), "auth.json"),
-		path.join(scriptDir, "auth.json"),
-	];
+	const candidates = [path.join(process.cwd(), "auth.json"), path.join(scriptDir, "auth.json")];
 	for (const p of candidates) {
 		if (!existsSync(p)) continue;
 		try {
 			const auth = JSON.parse(readFileSync(p, "utf8"));
 			const creds = auth?.["openai-codex"];
-			if (creds && typeof creds.access === "string" && creds.access.length > 0) {
-				return creds.access;
-			}
-		} catch {
-			// Ignore malformed auth file and continue.
-		}
+			if (creds && typeof creds.access === "string" && creds.access.length > 0) return creds.access;
+		} catch {}
 	}
 	return undefined;
 }
 
-function getLastAssistantText(messages) {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const m = messages[i];
-		if (m.role !== "assistant") continue;
-		const t = (m.content || [])
-			.filter((c) => c.type === "text")
-			.map((c) => c.text)
-			.join("")
-			.trim();
-		if (t) return t;
-	}
-	return "";
+function now() {
+	return new Date().toISOString().slice(11, 19);
+}
+
+function sleep(ms) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchJson(url, init = {}) {
+	const res = await fetch(url, init);
+	if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+	return await res.json();
 }
 
 loadDotEnvFromCwdAndParents();
@@ -315,6 +367,34 @@ function loadContextFile(name) {
 	return readFileSync(path.join(agentDir, name), "utf8").trim();
 }
 
+const worldBaseUrl = process.env.WORLD_BASE_URL || "http://localhost:8080";
+const worldAgentName = process.env.WORLD_AGENT_NAME || `${scriptName}-${process.pid}`;
+const observeIntervalMs = Number(process.env.OBSERVE_MS || "2000");
+let worldSession = "";
+let worldAgentId = "";
+let observeLoopEnabled = true;
+let observeTimer = null;
+
+async function joinWorldOrThrow() {
+	let lastErr = null;
+	for (let i = 0; i < 5; i++) {
+		try {
+			const join = await fetchJson(
+				`${worldBaseUrl}/join?name=${encodeURIComponent(worldAgentName)}`,
+				{ method: "POST" },
+			);
+			if (!join?.session) throw new Error("join response missing session");
+			worldSession = String(join.session);
+			worldAgentId = String(join.agent_id || "");
+			return;
+		} catch (err) {
+			lastErr = err;
+			await sleep(300);
+		}
+	}
+	throw new Error(`Failed to join world at ${worldBaseUrl}: ${lastErr instanceof Error ? lastErr.message : String(lastErr)}`);
+}
+
 function buildActionSystemPrompt() {
 	const base = process.env.PI_ACTION_SYSTEM_PROMPT || process.env.PI_SYSTEM_PROMPT || "";
 	const lines = [base];
@@ -335,11 +415,23 @@ function buildActionSystemPrompt() {
 		"## Workspace",
 		"",
 		`Your workspace is ${agentDir}. Only work inside this directory.`,
-		"Use tools to play/observe quickly and report concise status.",
-		"When asked to observe, run /observe via bash and summarize the result briefly.",
+		"",
+		"## Live Game Session",
+		"",
+		`World base URL: ${worldBaseUrl}`,
+		`Session key (X-Session): ${worldSession}`,
+		`Agent id: ${worldAgentId || "(unknown)"}`,
+		"",
+		"At the start of a session, fetch world commands with: curl -sS ${worldBaseUrl}/skill.md",
+		"Use bash/curl to do this yourself when needed.",
+		"",
+		"You are already joined. Use this session key in bash/curl calls to play immediately.",
+		"Always include header: X-Session: <session key> for /observe and /input."
 	);
 	return lines.join("\n");
 }
+
+await joinWorldOrThrow();
 
 const speechBase = process.env.PI_SPEECH_SYSTEM_PROMPT || process.env.PI_SYSTEM_PROMPT || "You are a speech agent in a game world.";
 const speechSystemPrompt = [
@@ -362,12 +454,10 @@ const modelName = process.env.PI_MODEL || (modelProvider === "openai-codex" ? "g
 const model = getModel(modelProvider, modelName);
 
 if (modelProvider === "openai-codex" && !codexAccessToken) {
-	console.error("Missing Codex OAuth token. Run: npx @mariozechner/pi-ai login openai-codex");
-	process.exit(1);
+	throw new Error("Missing Codex OAuth token. Run: npx @mariozechner/pi-ai login openai-codex");
 }
 if (modelProvider === "anthropic" && !anthropicApiKey) {
-	console.error("Missing ANTHROPIC_API_KEY (set env var or add it to .env)");
-	process.exit(1);
+	throw new Error("Missing ANTHROPIC_API_KEY (set env var or add it to .env)");
 }
 
 const speechAgent = new Agent({
@@ -398,19 +488,21 @@ const actionAgent = new Agent({
 		return undefined;
 	},
 });
+actionAgent.setSteeringMode("all");
 
-let speechBusy = false;
-let actionBusy = false;
+const state = {
+	speechBusy: false,
+	actionBusy: false,
+	speechLines: [],
+	actionLines: [],
+	speechLiveLine: "",
+	actionLiveLine: "",
+	speechPinnedUser: "",
+	actionPinnedUser: "",
+};
+
 let isClosing = false;
-let speechSawDelta = false;
-let speechPrefixPrinted = false;
-
-const observeIntervalMs = Number(process.env.OBSERVE_MS || "3000");
-const observePrompt = process.env.OBSERVE_PROMPT || "Run /observe using bash. Return a concise plain-text summary.";
-let observeTimer = null;
-let observeEnabled = true;
-let observeSeq = 0;
-let lastObservedText = "";
+let actionSawDelta = false;
 
 const elevenLabsApiKey = process.env.ELEVENLABS_API_KEY || "";
 const elevenLabsVoiceId =
@@ -427,6 +519,27 @@ const audioPlayer =
 			})
 		: null;
 
+const terminal = new ProcessTerminal();
+const tui = new TUI(terminal, true);
+const split = new TwoPaneLogs(terminal, state);
+const inputBox = new Input();
+
+function trimBuffer(arr, max = 200) {
+	if (arr.length > max) arr.splice(0, arr.length - max);
+}
+
+function addSpeechLine(text) {
+	state.speechLines.push(`[${now()}] ${text}`);
+	trimBuffer(state.speechLines);
+	tui.requestRender();
+}
+
+function addActionLine(text) {
+	state.actionLines.push(`[${now()}] ${text}`);
+	trimBuffer(state.actionLines);
+	tui.requestRender();
+}
+
 function persistSpeechConversation() {
 	writeFileSync(speechConversationPath, JSON.stringify(speechAgent.state.messages, null, 2));
 }
@@ -435,83 +548,67 @@ function persistActionConversation() {
 	writeFileSync(actionConversationPath, JSON.stringify(actionAgent.state.messages, null, 2));
 }
 
-function printPrompt(rl) {
-	if (!isClosing && !speechBusy) rl.prompt();
-}
-
-function injectObservationToSpeech(observeText) {
-	const text = observeText.trim();
-	if (!text) return;
-	if (text === lastObservedText) return;
-	lastObservedText = text;
-	observeSeq += 1;
-	const toolCallId = `observe_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-	const ts = Date.now();
-
-	speechAgent.steer({
-		role: "assistant",
-		content: [{ type: "toolCall", id: toolCallId, name: "act_in_world", arguments: { action: { type: "Observe", data: { step: observeSeq } } } }],
-		api: model.api,
-		provider: model.provider,
-		model: model.id,
-		usage: {
-			input: 0,
-			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 0,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		},
-		stopReason: "toolUse",
-		timestamp: ts,
-	});
-
-	speechAgent.steer({
-		role: "toolResult",
-		toolCallId,
-		toolName: "act_in_world",
-		content: [{ type: "text", text: JSON.stringify({ ok: true, observation: { ts, observe_text: text } }) }],
-		details: {},
-		isError: false,
-		timestamp: ts,
-	});
-}
-
-async function runSpeechContinue(rl, options = {}) {
-	speechBusy = true;
+async function runSpeechPrompt(text) {
+	state.speechBusy = true;
+	tui.requestRender();
 	try {
-		await speechAgent.continue();
+		await speechAgent.prompt(text);
 	} catch (error) {
-		console.error("Speech continue error:", error instanceof Error ? error.message : error);
+		addSpeechLine(`[error] ${error instanceof Error ? error.message : String(error)}`);
 	} finally {
-		speechBusy = false;
-		if (!options.silentPrompt) printPrompt(rl);
+		state.speechBusy = false;
+		tui.requestRender();
 	}
 }
 
-async function runObserveOnce(rl, { forceSpeak = false } = {}) {
-	if (isClosing || !observeEnabled || actionBusy) return;
-	actionBusy = true;
+async function runActionPrompt(text) {
+	if (isClosing || state.actionBusy) return;
+	state.actionBusy = true;
+	actionSawDelta = false;
+	state.actionLiveLine = "";
+	tui.requestRender();
 	try {
-		await actionAgent.prompt(observePrompt);
-		const observedText = getLastAssistantText(actionAgent.state.messages);
-		injectObservationToSpeech(observedText);
-		if ((forceSpeak || speechAgent.state.messages.length > 0) && !speechBusy) {
-			await runSpeechContinue(rl, { silentPrompt: true });
-		}
+		await actionAgent.prompt(text);
 	} catch (error) {
-		output.write(`[observe] error: ${error instanceof Error ? error.message : String(error)}\n`);
+		addActionLine(`[error] ${error instanceof Error ? error.message : String(error)}`);
 	} finally {
-		actionBusy = false;
+		state.actionBusy = false;
+		state.actionLiveLine = "";
+		tui.requestRender();
 	}
 }
 
-function startObserveLoop(rl) {
-	if (!Number.isFinite(observeIntervalMs) || observeIntervalMs < 250) return;
-	if (observeTimer) clearInterval(observeTimer);
-	observeTimer = setInterval(() => {
-		void runObserveOnce(rl);
-	}, observeIntervalMs);
+async function runActionContinue() {
+	if (isClosing || state.actionBusy) return;
+	state.actionBusy = true;
+	actionSawDelta = false;
+	state.actionLiveLine = "";
+	tui.requestRender();
+	try {
+		await actionAgent.continue();
+	} catch (error) {
+		addActionLine(`[error] ${error instanceof Error ? error.message : String(error)}`);
+	} finally {
+		state.actionBusy = false;
+		state.actionLiveLine = "";
+		tui.requestRender();
+	}
+}
+
+function queueObserveForAction(observation) {
+	actionAgent.steer({
+		role: "user",
+		content: [{ type: "text", text: `[observe] ${JSON.stringify(observation)}` }],
+		timestamp: Date.now(),
+	});
+}
+
+async function fetchObserve() {
+	if (!worldSession) return null;
+	return await fetchJson(`${worldBaseUrl}/observe`, {
+		method: "GET",
+		headers: { "X-Session": worldSession },
+	});
 }
 
 function stopObserveLoop() {
@@ -519,162 +616,215 @@ function stopObserveLoop() {
 	observeTimer = null;
 }
 
+function startObserveLoop() {
+	stopObserveLoop();
+	observeLoopEnabled = true;
+	observeTimer = setInterval(async () => {
+		if (!observeLoopEnabled || isClosing) return;
+		try {
+			const obs = await fetchObserve();
+			if (!obs) return;
+			queueObserveForAction(obs);
+			if (!state.actionBusy) void runActionContinue();
+		} catch (error) {
+			addActionLine(`[observe] error: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}, Math.max(250, observeIntervalMs));
+}
+
 speechAgent.subscribe((event) => {
 	persistSpeechConversation();
 
 	if (event.type === "message_start" && event.message.role === "assistant") {
-		speechSawDelta = false;
-		speechPrefixPrinted = false;
+		state.speechLiveLine = "assistant>";
+		tui.requestRender();
 		return;
 	}
-
 	if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-		speechSawDelta = true;
-		if (!speechPrefixPrinted) {
-			output.write("speech> ");
-			speechPrefixPrinted = true;
-		}
-		output.write(event.assistantMessageEvent.delta);
+		state.speechLiveLine += event.assistantMessageEvent.delta;
+		tui.requestRender();
 		return;
 	}
-
 	if (event.type === "message_end" && event.message.role === "assistant") {
-		let fullText = "";
-		const errorMessage = event.message.errorMessage;
-		const hasText = event.message.content.some((c) => c.type === "text" && c.text.trim().length > 0);
-		if (!speechSawDelta) {
-			fullText = event.message.content.filter((c) => c.type === "text").map((c) => c.text).join("");
-			if (hasText) {
-				output.write(`speech> ${fullText}\n`);
-				speechPrefixPrinted = true;
-			}
-		} else {
-			fullText = event.message.content.filter((c) => c.type === "text").map((c) => c.text).join("");
-			output.write("\n");
-		}
-		if (errorMessage) output.write(`[error] ${errorMessage}\n`);
-
-		speechSawDelta = false;
-		speechPrefixPrinted = false;
+		const fullText = event.message.content.filter((c) => c.type === "text").map((c) => c.text).join("");
+		if (fullText.trim().length > 0) addSpeechLine(`assistant> ${fullText}`);
+		const err = event.message.errorMessage;
+		if (err) addSpeechLine(`[error] ${err}`);
 
 		const spoken = extractSpeakSegments(fullText);
-		if (spoken.length > 0) {
-			for (const seg of spoken) {
-				output.write(`[speak] ${seg}\n`);
-				audioPlayer?.enqueue(seg);
-			}
+		for (const seg of spoken) {
+			addSpeechLine(`[speak] ${seg}`);
+			audioPlayer?.enqueue(seg);
 		}
+		state.speechLiveLine = "";
+		state.speechPinnedUser = "";
+		tui.requestRender();
 	}
 });
 
 actionAgent.subscribe((event) => {
 	persistActionConversation();
-	if (process.env.ACTION_DEBUG !== "1") return;
+	if (event.type === "message_start" && event.message.role === "assistant") {
+		actionSawDelta = false;
+		state.actionLiveLine = "assistant>";
+		tui.requestRender();
+		return;
+	}
+	if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+		actionSawDelta = true;
+		state.actionLiveLine += event.assistantMessageEvent.delta;
+		tui.requestRender();
+		return;
+	}
+	if (event.type === "message_update" && event.assistantMessageEvent.type === "toolcall_end") {
+		const tc = event.assistantMessageEvent.toolCall;
+		addActionLine(`[tool] ${tc.name}(${JSON.stringify(tc.arguments)})`);
+	}
 	if (event.type === "message_end" && event.message.role === "assistant") {
 		const txt = event.message.content.filter((c) => c.type === "text").map((c) => c.text).join("").trim();
-		if (txt) output.write(`[action] ${txt}\n`);
+		if (txt) addActionLine(`assistant> ${txt}`);
+		state.actionLiveLine = "";
+		state.actionPinnedUser = "";
+		tui.requestRender();
 	}
 });
 
-const rl = createInterface({ input, output, terminal: true });
-rl.setPrompt("you> ");
-output.write(`Dual-agent ready with model \"${modelName}\" (${modelProvider}).\n`);
-output.write("Commands: /reset, /quit, /observe on|off|status|once\n");
-if (audioPlayer) {
-	audioPlayer.start()
-		.then(() => output.write(`ElevenLabs audio enabled (voice=${elevenLabsVoiceId}).\n`))
-		.catch((err) => output.write(`[audio] failed to start: ${err instanceof Error ? err.message : String(err)}\n`));
-} else {
-	output.write("ElevenLabs audio disabled (set ELEVENLABS_API_KEY + AGENT_A_VOICE_ID/AGENT_VOICE_ID).\n");
-}
-if (observeEnabled) {
-	startObserveLoop(rl);
-	output.write(`Observe loop started (${observeIntervalMs}ms).\n`);
-}
-printPrompt(rl);
-
-rl.on("line", (rawLine) => {
-	const line = rawLine.trim();
-	if (!line) {
-		printPrompt(rl);
-		return;
-	}
+async function handleCommand(line) {
 	if (line === "/quit" || line === "/exit") {
 		isClosing = true;
-		rl.close();
+		audioPlayer?.close();
+		persistSpeechConversation();
+		persistActionConversation();
+		tui.stop();
+		process.exit(0);
 		return;
 	}
 	if (line === "/reset") {
-		if (speechBusy) speechAgent.abort();
-		if (actionBusy) actionAgent.abort();
+		if (state.speechBusy) speechAgent.abort();
+		if (state.actionBusy) actionAgent.abort();
 		speechAgent.reset();
 		actionAgent.reset();
 		speechAgent.setSystemPrompt(speechSystemPrompt);
 		actionAgent.setSystemPrompt(buildActionSystemPrompt());
-		lastObservedText = "";
-		output.write("speech> Context cleared.\n");
-		printPrompt(rl);
+		addSpeechLine("Context cleared.");
+		return;
+	}
+	if (line === "/session") {
+		addActionLine(`session=${worldSession}`);
 		return;
 	}
 	if (line === "/observe status") {
-		output.write(`speech> Observe is ${observeEnabled ? "on" : "off"} (${observeIntervalMs}ms).\n`);
-		printPrompt(rl);
+		addActionLine(`observe=${observeLoopEnabled ? "on" : "off"} interval=${observeIntervalMs}ms session=${worldSession ? "set" : "missing"}`);
 		return;
 	}
 	if (line === "/observe on") {
-		observeEnabled = true;
-		startObserveLoop(rl);
-		output.write("speech> Observe loop on.\n");
-		printPrompt(rl);
+		if (!observeLoopEnabled) startObserveLoop();
+		addActionLine(`observe=on (${observeIntervalMs}ms)`);
 		return;
 	}
 	if (line === "/observe off") {
-		observeEnabled = false;
+		observeLoopEnabled = false;
 		stopObserveLoop();
-		output.write("speech> Observe loop off.\n");
-		printPrompt(rl);
+		addActionLine("observe=off");
 		return;
 	}
 	if (line === "/observe once") {
-		void runObserveOnce(rl, { forceSpeak: true });
-		printPrompt(rl);
+		try {
+			const obs = await fetchObserve();
+			if (obs) {
+				queueObserveForAction(obs);
+				if (!state.actionBusy) void runActionContinue();
+				addActionLine("observe=once queued");
+			}
+		} catch (error) {
+			addActionLine(`[observe] error: ${error instanceof Error ? error.message : String(error)}`);
+		}
+		return;
+	}
+	if (line.startsWith("/a ")) {
+		const text = line.slice(3).trim();
+		if (!text) return;
+		state.actionPinnedUser = `you> ${text}`;
+		addActionLine(`you> ${text}`);
+		if (state.actionBusy) {
+			addActionLine("Still processing previous request.");
+			return;
+		}
+		void runActionPrompt(text);
+		return;
+	}
+	if (line === "/a") {
+		addActionLine("Usage: /a <message>");
+		return;
+	}
+	if (line.startsWith("/s ")) {
+		const text = line.slice(3).trim();
+		if (!text) return;
+		state.speechPinnedUser = `you> ${text}`;
+		addSpeechLine(`you> ${text}`);
+		if (state.speechBusy) {
+			addSpeechLine("Still processing previous request.");
+			return;
+		}
+		void runSpeechPrompt(text);
+		return;
+	}
+	if (line === "/s") {
+		addSpeechLine("Usage: /s <message>");
 		return;
 	}
 
-	if (speechBusy) {
-		speechAgent.steer({ role: "user", content: [{ type: "text", text: line }], timestamp: Date.now() });
-		output.write("speech> Queued steer message.\n");
-		printPrompt(rl);
+	if (state.speechBusy) {
+		state.speechPinnedUser = `you> ${line}`;
+		addSpeechLine(`you> ${line}`);
+		addSpeechLine("Still processing previous request.");
 		return;
 	}
 
-	const userMessage = { role: "user", content: [{ type: "text", text: line }], timestamp: Date.now() };
-	if (speechAgent.state.messages.length === 0) {
-		speechAgent.appendMessage(userMessage);
-	} else {
-		speechAgent.steer(userMessage);
-	}
-	void runSpeechContinue(rl);
-});
+	state.speechPinnedUser = `you> ${line}`;
+	addSpeechLine(`you> ${line}`);
+	void runSpeechPrompt(line);
+}
 
-rl.on("SIGINT", () => {
-	if (speechBusy || actionBusy) {
+tui.addChild(split);
+tui.addChild(inputBox);
+tui.setFocus(inputBox);
+
+inputBox.onSubmit = (value) => {
+	const line = value.trim();
+	inputBox.setValue("");
+	if (!line) {
+		tui.requestRender();
+		return;
+	}
+	void handleCommand(line);
+};
+
+process.on("SIGINT", () => {
+	if (state.speechBusy || state.actionBusy) {
 		speechAgent.abort();
 		actionAgent.abort();
-		output.write("\nspeech> Aborted.\n");
-		speechBusy = false;
-		actionBusy = false;
-		printPrompt(rl);
+		state.speechBusy = false;
+		state.actionBusy = false;
+		addSpeechLine("Aborted.");
 		return;
 	}
-	isClosing = true;
-	rl.close();
+	void handleCommand("/quit");
 });
 
-rl.on("close", () => {
-	stopObserveLoop();
-	audioPlayer?.close();
-	persistSpeechConversation();
-	persistActionConversation();
-	process.exit(0);
-});
+addActionLine(`Dual-agent ready with model "${modelName}" (${modelProvider}).`);
+addActionLine(`World joined: ${worldBaseUrl} agent=${worldAgentName}`);
+addActionLine(`Session key: ${worldSession}`);
+addSpeechLine("Commands: /reset, /quit, /session, /observe on|off|status|once, /a <msg>, /s <msg> (plain text goes to speech)");
+if (audioPlayer) {
+	audioPlayer
+		.start()
+		.then(() => addSpeechLine(`ElevenLabs audio enabled (voice=${elevenLabsVoiceId}).`))
+		.catch((err) => addSpeechLine(`[audio] failed to start: ${err instanceof Error ? err.message : String(err)}`));
+} else {
+	addSpeechLine("ElevenLabs audio disabled (set ELEVENLABS_API_KEY + AGENT_A_VOICE_ID/AGENT_VOICE_ID).");
+}
+
+startObserveLoop();
+
+tui.start();

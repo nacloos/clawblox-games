@@ -357,6 +357,7 @@ class ElevenLabsRealtimePlayer {
 		while (!this.closed) {
 			const msg = await this.nextMessage(2500);
 			if (!msg) break;
+			if (msg.error) { console.error("[audio] ElevenLabs error:", msg); break; }
 			if (msg.audio && this.ffplay?.stdin?.writable) {
 				try {
 					this.ffplay.stdin.write(Buffer.from(msg.audio, "base64"));
@@ -387,7 +388,7 @@ class ElevenLabsRealtimePlayer {
 		const cleaned = text.trim();
 		if (!cleaned) return;
 		this.queue.push(cleaned);
-		this.processQueue().catch(() => {});
+		this.processQueue().catch((err) => { console.error("[audio] processQueue error:", err); });
 	}
 
 	async start() {
@@ -630,7 +631,26 @@ const state = {
 let isClosing = false;
 let actionSawDelta = false;
 let actionStreamText = "";
+let lastActionActivityAt = 0;
+let actionIdleTimer = null;
+const ACTION_IDLE_MS = 4000;
 let speechIntentBuffer = [];
+
+function startActionIdleTimer() {
+	stopActionIdleTimer();
+	actionIdleTimer = setInterval(() => {
+		if (!state.actionBusy || isClosing) return;
+		if (Date.now() - lastActionActivityAt < ACTION_IDLE_MS) return;
+		lastActionActivityAt = Date.now();
+		injectActionForSpeech([{ action: "still working...", observation: "" }]);
+		if (!state.speechBusy) void runSpeechContinue();
+	}, ACTION_IDLE_MS);
+}
+
+function stopActionIdleTimer() {
+	if (actionIdleTimer) clearInterval(actionIdleTimer);
+	actionIdleTimer = null;
+}
 
 const elevenLabsApiKey = process.env.ELEVENLABS_API_KEY || "";
 const elevenLabsVoiceId =
@@ -709,6 +729,8 @@ async function runActionContinue() {
 	state.actionBusy = true;
 	actionSawDelta = false;
 	state.actionLiveLine = "";
+	lastActionActivityAt = Date.now();
+	startActionIdleTimer();
 	tui.requestRender();
 	try {
 		await actionAgent.continue();
@@ -717,6 +739,7 @@ async function runActionContinue() {
 	} finally {
 		state.actionBusy = false;
 		state.actionLiveLine = "";
+		stopActionIdleTimer();
 		tui.requestRender();
 	}
 }
@@ -726,6 +749,8 @@ async function runActionPrompt(text) {
 	state.actionBusy = true;
 	actionSawDelta = false;
 	state.actionLiveLine = "";
+	lastActionActivityAt = Date.now();
+	startActionIdleTimer();
 	tui.requestRender();
 	try {
 		await actionAgent.prompt(text);
@@ -734,6 +759,7 @@ async function runActionPrompt(text) {
 	} finally {
 		state.actionBusy = false;
 		state.actionLiveLine = "";
+		stopActionIdleTimer();
 		tui.requestRender();
 	}
 }
@@ -905,6 +931,7 @@ actionAgent.subscribe((event) => {
 		if (activities.length > 0) {
 			actionStreamText = actionStreamText.replace(/<step>[\s\S]*?<\/step>/g, "");
 			injectActionForSpeech(activities);
+			lastActionActivityAt = Date.now();
 			if (!state.speechBusy) void runSpeechContinue();
 		}
 
@@ -943,6 +970,8 @@ async function handleCommand(line) {
 		actionAgent.setSystemPrompt(buildActionSystemPrompt());
 		lastObservation = null;
 		actionStreamText = "";
+		lastActionActivityAt = 0;
+		stopActionIdleTimer();
 		speechIntentBuffer = [];
 		addSpeechLine("Context cleared.");
 		return;

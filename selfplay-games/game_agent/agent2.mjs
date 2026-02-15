@@ -2,8 +2,9 @@ import { Agent } from "/home/nacloos/Code/pi-mono/packages/agent/dist/index.js";
 import { getModel } from "/home/nacloos/Code/pi-mono/packages/ai/dist/index.js";
 import { createCodingTools } from "/home/nacloos/Code/pi-mono/packages/coding-agent/dist/index.js";
 import { ProcessTerminal, TUI, Input, truncateToWidth, visibleWidth } from "/home/nacloos/Code/pi-mono/packages/tui/dist/index.js";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from "node:fs";
 import path from "node:path";
+import WebSocketClient from "ws";
 
 function loadDotEnvIntoProcessEnv(envPath) {
 	if (!existsSync(envPath)) return;
@@ -173,9 +174,37 @@ class TwoPaneLogs {
 	invalidate() {}
 
 	render(width) {
+		const rows = Math.max(8, this.terminal.rows - 4);
+		const singlePane = this.state.speechDisabled || this.state.actionDisabled;
+
+		if (singlePane) {
+			const panelWidth = Math.max(16, width);
+			const isSpeech = !this.state.speechDisabled;
+			const logLines = isSpeech ? this.state.speechLines : this.state.actionLines;
+			const liveLine = isSpeech ? this.state.speechLiveLine : this.state.actionLiveLine;
+			const pinnedUser = isSpeech ? this.state.speechPinnedUser : this.state.actionPinnedUser;
+			const busy = isSpeech ? this.state.speechBusy : this.state.actionBusy;
+			const label = isSpeech ? "Speech" : "Action";
+
+			const all = [];
+			for (const line of logLines) all.push(...wrapLine(line, panelWidth));
+			if (liveLine) all.push(...wrapLine(liveLine, panelWidth));
+			const pinned = pinnedUser ? singleLine(pinnedUser) : "";
+
+			const bodyRows = Math.max(1, rows - 1);
+			const visible = [...all.slice(-bodyRows), pinned];
+			const count = Math.max(visible.length, rows);
+
+			const status = busy ? "busy" : "idle";
+			const lines = [padOrTrimToWidth(` ${label} (${status}) `, panelWidth)];
+			for (let i = 0; i < count; i++) {
+				lines.push(padOrTrimToWidth(visible[i] || "", panelWidth));
+			}
+			return lines;
+		}
+
 		const sep = " | ";
 		const panelWidth = Math.max(16, Math.floor((width - sep.length) / 2));
-		const rows = Math.max(8, this.terminal.rows - 4);
 
 		const leftAll = [];
 		for (const line of this.state.speechLines) leftAll.push(...wrapLine(line, panelWidth));
@@ -208,52 +237,273 @@ class TwoPaneLogs {
 	}
 }
 
-class ElevenLabsStreamingPlayer {
+// Sentence-boundary punctuation and limits for incremental TTS chunking.
+const _TTS_PUNCT = [".", "!", "?", "\n", ":", ";"];
+const _TTS_MIN_SENTENCE_CHARS = 24;
+const _TTS_MAX_BUFFER_CHARS = 80;
+
+function popTtsEmitText(buffer) {
+	let lastBoundary = -1;
+	for (const marker of _TTS_PUNCT) {
+		const idx = buffer.lastIndexOf(marker);
+		if (idx > lastBoundary) lastBoundary = idx;
+	}
+	if (lastBoundary + 1 >= _TTS_MIN_SENTENCE_CHARS) {
+		return [buffer.slice(0, lastBoundary + 1), buffer.slice(lastBoundary + 1)];
+	}
+	if (buffer.length >= _TTS_MAX_BUFFER_CHARS) {
+		let splitIdx = buffer.lastIndexOf(" ", _TTS_MAX_BUFFER_CHARS);
+		if (splitIdx < _TTS_MIN_SENTENCE_CHARS) splitIdx = _TTS_MAX_BUFFER_CHARS;
+		return [buffer.slice(0, splitIdx), buffer.slice(splitIdx)];
+	}
+	return ["", buffer];
+}
+
+class ElevenLabsMultiContextPlayer {
 	constructor({ apiKey, voiceId, modelId = "eleven_flash_v2_5", audioUrl, sessionToken }) {
 		this.apiKey = apiKey;
 		this.voiceId = voiceId;
 		this.modelId = modelId;
 		this.audioUrl = audioUrl;
 		this.sessionToken = sessionToken;
-		this.queue = [];
-		this.processing = false;
 		this.closed = false;
+		this.ws = null;
+		this.wsReady = false;
+		this.currentContextId = null;
+		this.contextStates = new Map(); // contextId -> { chunkCount, lastChunkTime, doneSent, resolve }
+		this.keepAliveTimer = null;
+		this.reconnectDelay = 1000;
+		// Streaming text state: accumulates LLM deltas, flushes at sentence boundaries
+		this._streamingCtx = null; // contextId for current streaming session
+		this._streamingBuffer = ""; // unflushed text
 	}
 
-	async speakOne(text) {
-		if (this.closed) return;
-		const streamId = `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-		const url = `https://api.elevenlabs.io/v1/text-to-speech/${this.voiceId}/stream`
-			+ `?output_format=pcm_24000`;
-		const res = await fetch(url, {
-			method: "POST",
-			headers: {
-				"xi-api-key": this.apiKey,
-				"Content-Type": "application/json",
-			},
-			body: JSON.stringify({
-				text,
-				model_id: this.modelId,
-				voice_settings: { stability: 0.45, similarity_boost: 0.8, use_speaker_boost: true },
-			}),
+	async start() {
+		await this._connect();
+	}
+
+	_connect() {
+		return new Promise((resolve, reject) => {
+			if (this.closed) return resolve();
+			const url = `wss://api.elevenlabs.io/v1/text-to-speech/${this.voiceId}/multi-stream-input`
+				+ `?model_id=${encodeURIComponent(this.modelId)}&output_format=pcm_24000`;
+			this.ws = new WebSocketClient(url, { headers: { "xi-api-key": this.apiKey } });
+			this.ws.binaryType = "arraybuffer";
+
+			this.ws.addEventListener("open", () => {
+				this.wsReady = true;
+				this.reconnectDelay = 1000;
+				this._startKeepAlive();
+				debugLog(`ElevenLabs WS connected`);
+				resolve();
+			});
+
+			this.ws.addEventListener("message", (event) => {
+				this._handleMessage(event.data);
+			});
+
+			this.ws.addEventListener("close", () => {
+				this.wsReady = false;
+				this._stopKeepAlive();
+				this._completeAllContexts();
+				if (!this.closed) {
+					setTimeout(() => {
+						this.reconnectDelay = Math.min(this.reconnectDelay * 2, 10000);
+						this._connect().catch(() => {});
+					}, this.reconnectDelay);
+				}
+			});
+
+			this.ws.addEventListener("error", (err) => {
+				debugLog(`ElevenLabs WS error: ${err.message || err}`);
+				if (!this.wsReady) reject(err);
+			});
 		});
-		if (!res.ok) {
-			const body = await res.text().catch(() => "");
-			console.error(`[audio] ElevenLabs HTTP error ${res.status}: ${body}`);
+	}
+
+	_handleMessage(raw) {
+		let data;
+		try {
+			const text = typeof raw === "string" ? raw : Buffer.isBuffer(raw) ? raw.toString("utf8") : new TextDecoder().decode(raw);
+			data = JSON.parse(text);
+		} catch (e) {
+			debugLog(`WS parse error: ${e.message}, raw type=${typeof raw}, len=${raw?.length || 0}`);
 			return;
 		}
 
-		const reader = res.body.getReader();
-		let seq = 0;
-		while (true) {
-			const { done, value } = await reader.read();
-			if (done) break;
-			await this.sendChunk(streamId, seq++, Buffer.from(value).toString("base64"), false);
+		const contextId = data.contextId || data.context_id;
+		const ctxState = contextId ? this.contextStates.get(contextId) : null;
+
+		if (data.audio && contextId) {
+			if (ctxState && !ctxState.doneSent) {
+				ctxState.chunkCount++;
+				ctxState.lastChunkTime = Date.now();
+				ctxState.totalAudioLen += data.audio.length;
+				if (!ctxState.playbackStartTime) ctxState.playbackStartTime = Date.now();
+				debugLog(`WS chunk #${ctxState.chunkCount} ctx=${contextId} audioLen=${data.audio.length}`);
+				void this._sendChunk(contextId, ctxState.chunkCount - 1, data.audio, false);
+			} else {
+				debugLog(`WS chunk for unknown/done ctx=${contextId}, ignoring`);
+			}
 		}
-		await this.sendChunk(streamId, seq, "", true);
+
+		if (data.isFinal || data.is_final) {
+			debugLog(`WS is_final ctx=${contextId} chunks=${ctxState?.chunkCount ?? "?"}`);
+			this._completeContext(contextId);
+		}
+
+		if (!data.audio && !data.isFinal && !data.is_final) {
+			debugLog(`WS unknown msg keys=${Object.keys(data).join(",")}`);
+		}
 	}
 
-	async sendChunk(streamId, seq, data, done) {
+	_completeContext(contextId) {
+		const ctxState = this.contextStates.get(contextId);
+		if (!ctxState || ctxState.doneSent) return;
+		ctxState.doneSent = true;
+		void this._sendChunk(contextId, ctxState.chunkCount, "", true);
+		if (ctxState.resolve) ctxState.resolve();
+	}
+
+	_startKeepAlive() {
+		this._stopKeepAlive();
+		this.keepAliveTimer = setInterval(() => {
+			if (this.wsReady && this.currentContextId) {
+				this._wsSend({ context_id: this.currentContextId, text: "" });
+			}
+		}, 15000);
+	}
+
+	_stopKeepAlive() {
+		if (this.keepAliveTimer) clearInterval(this.keepAliveTimer);
+		this.keepAliveTimer = null;
+	}
+
+	_wsSend(msg) {
+		if (this.ws && this.wsReady) {
+			this.ws.send(JSON.stringify(msg));
+		}
+	}
+
+	_completeAllContexts() {
+		for (const [contextId] of this.contextStates) {
+			this._completeContext(contextId);
+		}
+		this.contextStates.clear();
+		this._streamingCtx = null;
+		this._streamingBuffer = "";
+	}
+
+	// --- Incremental streaming API (matches audio.py pattern) ---
+
+	/** Send a text chunk from the LLM stream. Accumulates and sends at sentence boundaries. */
+	sendTextChunk(chunk) {
+		if (this.closed || !this.wsReady || !chunk) return;
+		// Open a new context on first chunk
+		if (!this._streamingCtx) {
+			const contextId = `ctx_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+			this._streamingCtx = contextId;
+			this._streamingBuffer = "";
+			this.currentContextId = contextId;
+			const ctxState = { chunkCount: 0, lastChunkTime: 0, doneSent: false, resolve: null, totalAudioLen: 0, playbackStartTime: 0 };
+			this.contextStates.set(contextId, ctxState);
+			debugLog(`sendTextChunk: new ctx=${contextId}`);
+			// Send voice_settings on the first message
+			this._wsSend({
+				context_id: contextId,
+				text: "",
+				voice_settings: { stability: 0.45, similarity_boost: 0.8, use_speaker_boost: true },
+			});
+		}
+		this._streamingBuffer += chunk;
+		// Emit sentence-sized pieces to ElevenLabs immediately
+		let [emit, rest] = popTtsEmitText(this._streamingBuffer);
+		while (emit) {
+			debugLog(`sendTextChunk: emit "${emit.slice(0, 60)}" to ctx=${this._streamingCtx}`);
+			this._wsSend({ context_id: this._streamingCtx, text: emit });
+			this._streamingBuffer = rest;
+			[emit, rest] = popTtsEmitText(this._streamingBuffer);
+		}
+	}
+
+	/** Flush the current streaming context: send remaining text + flush signal, wait for audio to finish. */
+	async flushStream({ trimMs = 0 } = {}) {
+		const contextId = this._streamingCtx;
+		if (!contextId) return;
+		this._streamingCtx = null;
+		const ctxState = this.contextStates.get(contextId);
+
+		// Send remaining buffered text
+		const remaining = this._streamingBuffer.trim();
+		this._streamingBuffer = "";
+		if (remaining) {
+			debugLog(`flushStream: emit remaining "${remaining.slice(0, 60)}" to ctx=${contextId}`);
+			this._wsSend({ context_id: contextId, text: remaining });
+		}
+		this._wsSend({ context_id: contextId, flush: true });
+		debugLog(`flushStream: flushed ctx=${contextId}`);
+
+		if (!ctxState) return;
+		const done = new Promise((resolve) => { ctxState.resolve = resolve; });
+
+		// Silence detector: 1.5s of no new chunks after first chunk = done
+		const silenceCheck = setInterval(() => {
+			if (ctxState.doneSent) { clearInterval(silenceCheck); return; }
+			if (ctxState.chunkCount > 0 && Date.now() - ctxState.lastChunkTime > 1500) {
+				debugLog(`flushStream ctx=${contextId} silence-done after ${ctxState.chunkCount} chunks`);
+				clearInterval(silenceCheck);
+				this._completeContext(contextId);
+			}
+		}, 200);
+
+		await Promise.race([done, sleep(15000)]);
+		clearInterval(silenceCheck);
+
+		if (!ctxState.doneSent) {
+			debugLog(`flushStream ctx=${contextId} timeout after ${ctxState.chunkCount} chunks`);
+			this._completeContext(contextId);
+		}
+		// Wait for estimated browser playback to complete
+		// PCM 24kHz 16-bit: durationMs = base64Len / 64
+		if (ctxState.playbackStartTime > 0 && ctxState.totalAudioLen > 0) {
+			const playbackMs = ctxState.totalAudioLen / 64;
+			const elapsed = Date.now() - ctxState.playbackStartTime;
+			const remaining = playbackMs - trimMs - elapsed;
+			if (remaining > 0) {
+				debugLog(`flushStream ctx=${contextId} waiting ${Math.round(remaining)}ms for playback (total ${Math.round(playbackMs)}ms)`);
+				await sleep(remaining);
+			}
+			debugLog(`flushStream ctx=${contextId} audio-end (duration=${Math.round(playbackMs)}ms, chunks=${ctxState.chunkCount})`);
+		}
+
+		this.contextStates.delete(contextId);
+	}
+
+	// --- Legacy batch API (kept for enqueue compatibility) ---
+
+	async speakOne(text) {
+		if (this.closed || !this.wsReady) {
+			debugLog(`speakOne skipped: closed=${this.closed} wsReady=${this.wsReady}`);
+			return;
+		}
+		this.sendTextChunk(text);
+		await this.flushStream();
+	}
+
+	interrupt() {
+		if (this._streamingCtx) {
+			this._wsSend({ context_id: this._streamingCtx, close_context: true });
+			this._completeContext(this._streamingCtx);
+			this._streamingCtx = null;
+			this._streamingBuffer = "";
+		} else if (this.currentContextId) {
+			this._wsSend({ context_id: this.currentContextId, close_context: true });
+			this._completeContext(this.currentContextId);
+		}
+		this.currentContextId = null;
+	}
+
+	async _sendChunk(streamId, seq, data, done) {
 		try {
 			await fetch(this.audioUrl, {
 				method: "POST",
@@ -264,21 +514,7 @@ class ElevenLabsStreamingPlayer {
 				body: JSON.stringify({ stream_id: streamId, seq, data, done }),
 			});
 		} catch (err) {
-			console.error(`[audio] sendChunk error: ${err instanceof Error ? err.message : String(err)}`);
-		}
-	}
-
-	async processQueue() {
-		if (this.processing || this.closed) return;
-		this.processing = true;
-		try {
-			while (this.queue.length > 0 && !this.closed) {
-				const text = this.queue.shift();
-				if (!text) continue;
-				await this.speakOne(text);
-			}
-		} finally {
-			this.processing = false;
+			debugLog(`sendChunk error: ${err instanceof Error ? err.message : String(err)}`);
 		}
 	}
 
@@ -286,15 +522,21 @@ class ElevenLabsStreamingPlayer {
 		if (this.closed) return;
 		const cleaned = text.trim();
 		if (!cleaned) return;
-		this.queue.push(cleaned);
-		this.processQueue().catch((err) => { console.error("[audio] processQueue error:", err); });
+		this.sendTextChunk(cleaned);
 	}
-
-	async start() {}
 
 	close() {
 		this.closed = true;
-		this.queue = [];
+		this._streamingCtx = null;
+		this._streamingBuffer = "";
+		this._stopKeepAlive();
+		this._completeAllContexts();
+		if (this.ws && this.wsReady) {
+			this._wsSend({ close_socket: true });
+			this.ws.close();
+		}
+		this.ws = null;
+		this.wsReady = false;
 	}
 }
 
@@ -309,6 +551,12 @@ function loadCodexAccessToken(scriptDir) {
 		} catch {}
 	}
 	return undefined;
+}
+
+const debugLogPath = path.join(path.dirname(new URL(import.meta.url).pathname), "debug.log");
+writeFileSync(debugLogPath, ""); // clear on start
+function debugLog(msg) {
+	appendFileSync(debugLogPath, `[${new Date().toISOString()}] ${msg}\n`);
 }
 
 function now() {
@@ -328,12 +576,16 @@ async function fetchJson(url, init = {}) {
 loadDotEnvFromCwdAndParents();
 
 const argv = process.argv.slice(2);
-const cliFlags = new Set(argv.filter((a) => a.startsWith("--")));
+const cliFlags = new Set(argv.filter((a) => a.startsWith("--") && !a.includes("=")));
+const cliNameArg = argv.find((a) => a.startsWith("--name="))?.split("=")[1]
+	|| argv[argv.indexOf("--name") + 1];
+const playbackTrimMs = Number(argv.find((a) => a.startsWith("--playback-trim="))?.split("=")[1] ?? 2000);
 
 const scriptPath = new URL(import.meta.url).pathname;
 const scriptDir = path.dirname(scriptPath);
 const scriptName = path.basename(scriptPath, path.extname(scriptPath));
-const resultsDir = path.join(scriptDir, "results", scriptName);
+const agentName = cliNameArg || process.env.WORLD_AGENT_NAME || scriptName;
+const resultsDir = path.join(scriptDir, "results", agentName);
 mkdirSync(resultsDir, { recursive: true });
 
 const speechConversationPath = path.join(resultsDir, "speech_conversation.json");
@@ -358,7 +610,7 @@ function loadContextFile(name) {
 }
 
 const worldBaseUrl = process.env.WORLD_BASE_URL || "http://localhost:8080";
-const worldAgentName = process.env.WORLD_AGENT_NAME || `${scriptName}-${process.pid}`;
+const worldAgentName = agentName || `${scriptName}-${process.pid}`;
 const observeIntervalMs = Number(process.env.OBSERVE_MS || "2000");
 let worldSession = "";
 let worldAgentId = "";
@@ -543,6 +795,9 @@ let actionIdleTimer = null;
 const ACTION_IDLE_MS = 2000;
 // const ACTION_IDLE_MS = 10000;
 let speechIntentBuffer = [];
+let speechStreamText = "";
+let ttsInsideSpeak = false; // true while accumulating text inside <speak>/<s> tag
+let ttsSpeakAccum = ""; // full text of current speak segment (for speech channel + logging)
 
 function startActionIdleTimer() {
 	stopActionIdleTimer();
@@ -566,7 +821,7 @@ const elevenLabsVoiceId =
 const elevenLabsModelId = process.env.ELEVENLABS_MODEL_ID || "eleven_flash_v2_5";
 const audioPlayer =
 	elevenLabsApiKey && elevenLabsVoiceId
-		? new ElevenLabsStreamingPlayer({
+		? new ElevenLabsMultiContextPlayer({
 				apiKey: elevenLabsApiKey,
 				voiceId: elevenLabsVoiceId,
 				modelId: elevenLabsModelId,
@@ -680,6 +935,19 @@ async function fetchObserve() {
 	});
 }
 
+async function postSpeechToServer(text) {
+	if (!worldSession) return;
+	try {
+		await fetch(`${worldBaseUrl}/speech`, {
+			method: "POST",
+			headers: { "X-Session": worldSession, "Content-Type": "application/json" },
+			body: JSON.stringify({ text }),
+		});
+	} catch (err) {
+		console.error(`[speech] post error: ${err instanceof Error ? err.message : String(err)}`);
+	}
+}
+
 function injectObserveForSpeech(observation) {
 	observeTick += 1;
 	const toolCallId = `bridge_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -758,6 +1026,36 @@ function injectSpeechForAction(intents) {
 	}
 }
 
+let speechPollActive = false;
+
+async function speechPollLoop() {
+	speechPollActive = true;
+	let lastSeq = 0;
+	while (!isClosing && speechPollActive) {
+		try {
+			const res = await fetch(`${worldBaseUrl}/speech?after=${lastSeq}&wait=true`, {
+				headers: { "X-Session": worldSession },
+			});
+			if (!res.ok) { await sleep(1000); continue; }
+			const data = await res.json();
+			for (const ev of data.events) {
+				if (ev.speaker === worldAgentName) continue;
+				lastSeq = Math.max(lastSeq, ev.seq);
+				addSpeechLine(`[heard] ${ev.speaker}: ${ev.text}`);
+				speechAgent.steer({
+					role: "user",
+					content: [{ type: "text", text: `[${ev.speaker} says]: ${ev.text}` }],
+					timestamp: Date.now(),
+				});
+				if (!state.speechBusy) void runSpeechContinue();
+			}
+			if (data.last_seq > lastSeq) lastSeq = data.last_seq;
+		} catch (err) {
+			if (!isClosing) await sleep(1000);
+		}
+	}
+}
+
 function stopObserveLoop() {
 	if (observeTimer) clearInterval(observeTimer);
 	observeTimer = null;
@@ -783,12 +1081,56 @@ speechAgent.subscribe((event) => {
 	persistSpeechConversation();
 
 	if (event.type === "message_start" && event.message.role === "assistant") {
+		speechStreamText = "";
+		ttsInsideSpeak = false;
+		ttsSpeakAccum = "";
 		state.speechLiveLine = "assistant>";
 		tui.requestRender();
 		return;
 	}
 	if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-		state.speechLiveLine += event.assistantMessageEvent.delta;
+		const delta = event.assistantMessageEvent.delta;
+		state.speechLiveLine += delta;
+		speechStreamText += delta;
+
+		// Stream text inside <speak>/<s> tags directly to TTS as it arrives.
+		// We parse the accumulated buffer for open/close tags and send inner text incrementally.
+		while (speechStreamText.length > 0) {
+			if (!ttsInsideSpeak) {
+				// Look for an opening tag
+				const openMatch = speechStreamText.match(/<(?:speak|s)>/);
+				if (!openMatch) break; // no opening tag yet, wait for more deltas
+				// Discard everything before and including the opening tag
+				speechStreamText = speechStreamText.slice(openMatch.index + openMatch[0].length);
+				ttsInsideSpeak = true;
+				ttsSpeakAccum = "";
+			}
+			// We're inside a speak tag — look for closing tag
+			const closeMatch = speechStreamText.match(/<\/(?:speak|s)>/);
+			if (closeMatch) {
+				// Send text before the closing tag
+				const inner = speechStreamText.slice(0, closeMatch.index);
+				if (inner) audioPlayer?.sendTextChunk(inner);
+				ttsSpeakAccum += inner;
+				speechStreamText = speechStreamText.slice(closeMatch.index + closeMatch[0].length);
+				ttsInsideSpeak = false;
+				// Flush this speak segment to ElevenLabs
+				addSpeechLine(`[speak] ${ttsSpeakAccum.slice(0, 80)}`);
+				// Wait for TTS audio to finish, then announce speech to other agents
+				const spokenText = ttsSpeakAccum;
+				ttsSpeakAccum = "";
+				audioPlayer?.flushStream({ trimMs: playbackTrimMs }).then(() => postSpeechToServer(spokenText));
+			} else {
+				// No closing tag yet — send what we have so far as incremental text
+				if (speechStreamText.length > 0) {
+					audioPlayer?.sendTextChunk(speechStreamText);
+					ttsSpeakAccum += speechStreamText;
+				}
+				speechStreamText = "";
+				break;
+			}
+		}
+
 		tui.requestRender();
 		return;
 	}
@@ -798,11 +1140,24 @@ speechAgent.subscribe((event) => {
 		const err = event.message.errorMessage;
 		if (err) addSpeechLine(`[error] ${err}`);
 
-		const spoken = extractSpeakSegments(fullText);
-		for (const seg of spoken) {
-			addSpeechLine(`[speak] ${seg}`);
-			audioPlayer?.enqueue(seg);
+		// Flush any remaining text if LLM ended mid-speak
+		if (ttsInsideSpeak) {
+			if (speechStreamText.trim()) {
+				audioPlayer?.sendTextChunk(speechStreamText);
+				ttsSpeakAccum += speechStreamText;
+			}
+			// Wait for TTS audio to finish, then announce speech to other agents
+			const spokenText = ttsSpeakAccum;
+			if (spokenText.trim()) {
+				audioPlayer?.flushStream({ trimMs: playbackTrimMs }).then(() => postSpeechToServer(spokenText));
+				addSpeechLine(`[speak] ${spokenText.slice(0, 80)}`);
+			} else {
+				audioPlayer?.flushStream();
+			}
 		}
+		speechStreamText = "";
+		ttsInsideSpeak = false;
+		ttsSpeakAccum = "";
 
 		const intents = extractIntents(fullText);
 		if (intents.length > 0) speechIntentBuffer.push(...intents);
@@ -862,6 +1217,7 @@ actionAgent.subscribe((event) => {
 async function handleCommand(line) {
 	if (line === "/quit" || line === "/exit") {
 		isClosing = true;
+		speechPollActive = false;
 		audioPlayer?.close();
 		persistSpeechConversation();
 		persistActionConversation();
@@ -1015,7 +1371,7 @@ if (audioPlayer) {
 	audioPlayer
 		.start()
 		.then(() => {
-			addSpeechLine(`ElevenLabs streaming TTS enabled (voice=${elevenLabsVoiceId}, audio=${audioPlayer.audioUrl}).`);
+			addSpeechLine(`ElevenLabs multi-context TTS enabled (voice=${elevenLabsVoiceId}, audio=${audioPlayer.audioUrl}).`);
 		})
 		.catch((err) => addSpeechLine(`[audio] failed to start: ${err instanceof Error ? err.message : String(err)}`));
 } else {
@@ -1023,6 +1379,7 @@ if (audioPlayer) {
 }
 
 // startObserveLoop();  // Disabled: speech agent now receives observations via action agent tool call injection
+void speechPollLoop();
 
 tui.start();
 

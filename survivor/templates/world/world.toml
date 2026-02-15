@@ -1,0 +1,19 @@
+name = "World"
+description = "The world"
+# max_players = 1
+max_players = 2
+game_type = "lua"
+
+[scripts]
+main = "main.luau"
+skill = "SKILL.md"
+
+[renderer]
+name = "World Renderer"
+mode = "module"
+api_version = 1
+entry = "index.js"
+capabilities = []
+
+[observation]
+radius = 40

@@ -1,3 +1,4 @@
 debug/
 results/
 auth.json
+node_modules/

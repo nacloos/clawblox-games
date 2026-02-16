@@ -2,6 +2,8 @@
 *.mp4
 *.mov
 *.mp3
+!survivor/templates/world/assets/bg.mp3
+!survivor/templates/world/assets/bg-sped.mp3
 *.env
 
 # Logs
@@ -30,4 +32,3 @@ venv/
 
 # Generated renderer bundle
 dist/
-

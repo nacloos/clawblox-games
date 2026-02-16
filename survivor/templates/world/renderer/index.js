@@ -80,6 +80,12 @@ const CHARACTERS = {
 
 const CHAR_ORDER = ['host', 'rodger_dodger', 'yasmin', 'guy', 'stephanie', 'tommy']
 const UI_PREVIEW_PREFIX = '[[ui_preview]] '
+const DEBUG_SPEECH_SYNC = true
+const MUSIC_PHASE_TRACK = {
+  voting: 'normal',
+  awaiting_reveal: 'normal',
+  result: 'sped',
+}
 
 // ── Embedded CSS ────────────────────────────────────────
 const STYLES = `
@@ -363,6 +369,108 @@ export function createRenderer(ctx) {
   let previousSpeaker = null  // agent name of previous speaker
   let hasSpeechStarted = false
   let previewSpeaker = null
+  let lastRenderSignature = ''
+  let gamePhase = 'voting'
+
+  // ── Background music (phase-based) ──
+  const MUSIC_VOL = 0.4
+  const MUSIC_FADE_MS = 1000
+  const bgMusic = new Audio('/assets/bg.mp3')
+  const bgSped = new Audio('/assets/bg-sped.mp3')
+  bgMusic.loop = true
+  bgSped.loop = true
+  bgMusic.preload = 'auto'
+  bgSped.preload = 'auto'
+  bgMusic.volume = 0
+  bgSped.volume = 0
+  let currentTrack = 'normal'
+  let desiredTrack = 'normal'
+  let audioUnlocked = false
+  let fadeTimer = null
+
+  function clearFadeTimer() {
+    if (fadeTimer) {
+      clearInterval(fadeTimer)
+      fadeTimer = null
+    }
+  }
+
+  function getTrackForPhase(phase) {
+    return MUSIC_PHASE_TRACK[phase] || 'normal'
+  }
+
+  function applyTrackVolumes(track) {
+    if (track === 'sped') {
+      bgMusic.volume = 0
+      bgSped.volume = MUSIC_VOL
+    } else {
+      bgMusic.volume = MUSIC_VOL
+      bgSped.volume = 0
+    }
+    currentTrack = track
+  }
+
+  function switchMusic(track) {
+    if (!audioUnlocked) {
+      desiredTrack = track
+      return
+    }
+    if (track === currentTrack) return
+    desiredTrack = track
+
+    const fadeOut = track === 'sped' ? bgMusic : bgSped
+    const fadeIn = track === 'sped' ? bgSped : bgMusic
+    clearFadeTimer()
+    const steps = 25
+    const interval = Math.max(16, Math.round(MUSIC_FADE_MS / steps))
+    let step = 0
+    const startOut = fadeOut.volume
+    const startIn = fadeIn.volume
+    fadeTimer = setInterval(() => {
+      step += 1
+      const progress = step / steps
+      fadeOut.volume = Math.max(0, startOut * (1 - progress))
+      fadeIn.volume = Math.min(MUSIC_VOL, startIn + (MUSIC_VOL - startIn) * progress)
+      if (step >= steps) {
+        clearFadeTimer()
+        applyTrackVolumes(track)
+      }
+    }, interval)
+  }
+
+  async function unlockAudio() {
+    if (audioUnlocked) return
+    audioUnlocked = true
+    try {
+      await Promise.all([
+        bgMusic.play(),
+        bgSped.play(),
+      ])
+      applyTrackVolumes(desiredTrack)
+    } catch (err) {
+      console.warn('[audio] failed to start background music', err)
+      audioUnlocked = false
+    }
+  }
+
+  function maybeUnlockAudio() {
+    void unlockAudio()
+  }
+
+  window.addEventListener('pointerdown', maybeUnlockAudio, { once: true, passive: true })
+  window.addEventListener('keydown', maybeUnlockAudio, { once: true })
+
+  function dbg(msg) {
+    if (!DEBUG_SPEECH_SYNC) return
+    console.log(`[sv-debug] ${msg}`)
+  }
+
+  function lockedSpeakerFromPlayers(list) {
+    const speaking = list.filter((p) => p?.attributes?.IsSpeaking === true)
+    if (speaking.length === 1) return speaking[0].name
+    if (speaking.length > 1) return speaking.map((p) => p.name).join(',')
+    return ''
+  }
 
   // ── Helpers ──
   function charData(agentName) {
@@ -480,6 +588,12 @@ export function createRenderer(ctx) {
         $chars.appendChild(el)
         requestAnimationFrame(() => el.classList.add('visible'))
       })
+      const lock = lockedSpeakerFromPlayers(players)
+      const sig = `pre|lock=${lock}|all=${ordered.map((p) => p.name).join(',')}`
+      if (sig !== lastRenderSignature) {
+        dbg(`render pre-speech ${sig}`)
+        lastRenderSignature = sig
+      }
       return
     }
 
@@ -502,6 +616,12 @@ export function createRenderer(ctx) {
       $chars.appendChild(el)
       requestAnimationFrame(() => el.classList.add('visible'))
     })
+    const lock = lockedSpeakerFromPlayers(players)
+    const sig = `post|lock=${lock}|current=${currentSpeaker || ''}|prev=${previousSpeaker || ''}|show=${toShow.map((e) => e.name).join(',')}`
+    if (sig !== lastRenderSignature) {
+      dbg(`render post-speech ${sig}`)
+      lastRenderSignature = sig
+    }
   }
 
   // ── Vote HUD ──
@@ -530,6 +650,8 @@ export function createRenderer(ctx) {
 
     // Track speaker transitions
     if (speaker !== currentSpeaker) {
+      const lock = lockedSpeakerFromPlayers(players)
+      dbg(`showSpeech switch speaker=${speaker} preview=${preview} instant=${instant} oldCurrent=${currentSpeaker || ''} oldPrev=${previousSpeaker || ''} lock=${lock || '(none)'}`)
       previousSpeaker = currentSpeaker
       currentSpeaker = speaker
       renderCharacters()
@@ -545,6 +667,8 @@ export function createRenderer(ctx) {
         typewriterTimer = null
       }
       $text.textContent = text
+      const lock = lockedSpeakerFromPlayers(players)
+      dbg(`showSpeech apply speaker=${speaker} mode=${preview ? 'preview' : 'instant'} textLen=${text.length} lock=${lock || '(none)'}`)
       return
     }
 
@@ -552,6 +676,8 @@ export function createRenderer(ctx) {
     if (typewriterTimer) clearInterval(typewriterTimer)
     $text.textContent = ''
     let i = 0
+    const lock = lockedSpeakerFromPlayers(players)
+    dbg(`showSpeech apply speaker=${speaker} mode=typewriter textLen=${text.length} lock=${lock || '(none)'}`)
     typewriterTimer = setInterval(() => {
       if (i < text.length) {
         $text.textContent += text[i]
@@ -565,15 +691,41 @@ export function createRenderer(ctx) {
 
   // ── Preload all assets on init ──
   preloadAssets()
+  desiredTrack = getTrackForPhase(gamePhase)
+  switchMusic(desiredTrack)
+
+  function extractGamePhase(state) {
+    if (!state || !Array.isArray(state.entities)) return null
+    for (const entity of state.entities) {
+      if (!entity || entity.name !== 'GameState') continue
+      const attrs = entity.attributes || {}
+      if (typeof attrs.phase === 'string' && attrs.phase.length > 0) {
+        return attrs.phase
+      }
+    }
+    return null
+  }
 
   // ── Renderer lifecycle ──
   return {
     onState(state) {
+      const nextPhase = extractGamePhase(state)
+      if (nextPhase && nextPhase !== gamePhase) {
+        gamePhase = nextPhase
+        switchMusic(getTrackForPhase(gamePhase))
+      }
+
       // Speech events arrive as {type: "speech", speaker, text, seq}
       if (state.type === 'speech') {
         const rawText = typeof state.text === 'string' ? state.text : ''
         const isPreview = rawText.startsWith(UI_PREVIEW_PREFIX)
         const text = isPreview ? rawText.slice(UI_PREVIEW_PREFIX.length) : rawText
+        const lock = lockedSpeakerFromPlayers(players)
+        const seq = state.seq ?? '?'
+        dbg(`speech event seq=${seq} speaker=${state.speaker} kind=${isPreview ? 'preview' : 'final'} textLen=${text.length} lock=${lock || '(none)'} current=${currentSpeaker || ''} previewSpeaker=${previewSpeaker || ''}`)
+        if (lock && lock !== state.speaker) {
+          dbg(`WARNING speaker/lock mismatch at speech event: eventSpeaker=${state.speaker} lock=${lock}`)
+        }
         if (isPreview) {
           previewSpeaker = state.speaker
           showSpeech(state.speaker, text, { preview: true })
@@ -600,8 +752,16 @@ export function createRenderer(ctx) {
             console.log(`[speaking] ${np.name} released speaking lock`)
           }
         }
+        const lockBefore = lockedSpeakerFromPlayers(players)
         players = newPlayers
         playersHash = h
+        const lockAfter = lockedSpeakerFromPlayers(players)
+        if (lockBefore !== lockAfter) {
+          dbg(`lock changed before=${lockBefore || '(none)'} after=${lockAfter || '(none)'} current=${currentSpeaker || ''} prev=${previousSpeaker || ''}`)
+          if (lockAfter && currentSpeaker && lockAfter !== currentSpeaker) {
+            dbg(`WARNING lock/UI mismatch after state update: lock=${lockAfter} uiCurrent=${currentSpeaker}`)
+          }
+        }
         renderCharacters()
         updateVoteHud()
       }
@@ -613,6 +773,13 @@ export function createRenderer(ctx) {
 
     unmount() {
       if (typewriterTimer) clearInterval(typewriterTimer)
+      clearFadeTimer()
+      window.removeEventListener('pointerdown', maybeUnlockAudio)
+      window.removeEventListener('keydown', maybeUnlockAudio)
+      bgMusic.pause()
+      bgSped.pause()
+      bgMusic.currentTime = 0
+      bgSped.currentTime = 0
       root.remove()
       styleEl.remove()
       ctx.canvas.style.display = ''

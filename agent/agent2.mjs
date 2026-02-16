@@ -521,11 +521,13 @@ const agentDir = path.join(gameDir, "workspace", agentName);
 const agentTemplateDir = path.join(gameDir, "templates", "agents", agentName);
 const defaultTemplateDir = path.join(gameDir, "templates", "agent");
 const worldTemplateDir = path.join(gameDir, "templates", "world");
+const SHARED_CONTEXT_FILES = new Set(["SOUL.md"]);
 function listMdFiles(dir) {
 	if (!existsSync(dir)) return [];
 	return readdirSync(dir).filter((f) => f.endsWith(".md"));
 }
-const contextFiles = [...new Set([...listMdFiles(defaultTemplateDir), ...listMdFiles(agentTemplateDir)])];
+const allContextFiles = [...new Set([...listMdFiles(defaultTemplateDir), ...listMdFiles(agentTemplateDir)])];
+const contextFiles = allContextFiles.filter((file) => !SHARED_CONTEXT_FILES.has(file));
 mkdirSync(agentDir, { recursive: true });
 for (const file of contextFiles) {
 	const dest = path.join(agentDir, file);
@@ -576,6 +578,8 @@ async function joinWorldOrThrow() {
 
 function buildWorkspaceContext() {
 	const lines = [];
+	const sharedSoulPath = path.join(defaultTemplateDir, "SOUL.md");
+	const sharedSoul = existsSync(sharedSoulPath) ? readFileSync(sharedSoulPath, "utf8").trim() : "";
 	lines.push(
 		"## Workspace",
 		"",
@@ -584,10 +588,13 @@ function buildWorkspaceContext() {
 		"",
 		"# Project Context",
 		"",
-		"The following files are loaded from your workspace. They are yours to evolve.",
-		"If SOUL.md is present, embody its persona and tone.",
+		"SOUL.md is shared globally across all agents from templates/agent/SOUL.md.",
+		"All other memory files below are agent-local workspace files.",
 		"",
 	);
+	if (sharedSoul) {
+		lines.push("---", "", `**SOUL.md** (${sharedSoulPath})`, "", sharedSoul, "");
+	}
 	for (const file of contextFiles) {
 		const filePath = path.join(agentDir, file);
 		const content = loadContextFile(file);
@@ -1272,7 +1279,7 @@ speechAgent.subscribe(async (event) => {
 							else ttsPendingText += inner;
 						}
 						ttsSpeakAccum += inner;
-						maybePostSpeechPreview(ttsSpeakAccum);
+						if (ttsCanStream) maybePostSpeechPreview(ttsSpeakAccum);
 						speechStreamText = speechStreamText.slice(closeMatch.index + closeMatch[0].length);
 						ttsInsideSpeak = false;
 					} else {
@@ -1281,7 +1288,7 @@ speechAgent.subscribe(async (event) => {
 							if (ttsCanStream) audioPlayer?.sendTextChunk(speechStreamText);
 							else ttsPendingText += speechStreamText;
 							ttsSpeakAccum += speechStreamText;
-							maybePostSpeechPreview(ttsSpeakAccum);
+							if (ttsCanStream) maybePostSpeechPreview(ttsSpeakAccum);
 						}
 						speechStreamText = "";
 						break;
@@ -1324,7 +1331,7 @@ speechAgent.subscribe(async (event) => {
 					const spokenText = ttsSpeakAccum;
 					if (spokenText.trim()) {
 						addSpeechLine(`[speak] ${spokenText.slice(0, 80)}`);
-						maybePostSpeechPreview(spokenText, true);
+						if (claimed) maybePostSpeechPreview(spokenText, true);
 						// Publish speech text with done chunk; server emits speech event on playback completion.
 						await audioPlayer?.flushStream({ speechText: spokenText });
 					} else {

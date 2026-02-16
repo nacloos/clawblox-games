@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tribal Council</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="title-screen">
+    <div id="title-bg"></div>
+    <div id="title-content">
+      <h1 id="title-heading">TRIBAL COUNCIL</h1>
+      <div id="title-subtitle">The tribe has spoken.</div>
+      <div id="title-prompt">Click anywhere to begin</div>
+    </div>
+  </div>
+
+  <div id="game-container" class="hidden">
+    <div id="background"></div>
+
+    <div id="character-area"></div>
+
+    <div id="dialogue-box">
+      <div id="speaker-name"></div>
+      <div id="dialogue-text"></div>
+      <div id="advance-indicator">Click or press Space to continue &#9654;</div>
+    </div>
+
+    <div id="line-counter"></div>
+  </div>
+
+  <audio id="audio-bg" src="bg.mp3" loop preload="auto"></audio>
+  <audio id="audio-sped" src="bg-sped.mp3" loop preload="auto"></audio>
+
+  <script src="screenplay.js"></script>
+  <script src="script.js"></script>
+</body>
+</html>

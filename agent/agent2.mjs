@@ -1,7 +1,6 @@
 import { Agent } from "/home/nacloos/Code/pi-mono/packages/agent/dist/index.js";
 import { getModel } from "/home/nacloos/Code/pi-mono/packages/ai/dist/index.js";
 import { createCodingTools } from "/home/nacloos/Code/pi-mono/packages/coding-agent/dist/index.js";
-import { ProcessTerminal, TUI, Input, truncateToWidth, visibleWidth } from "/home/nacloos/Code/pi-mono/packages/tui/dist/index.js";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, appendFileSync } from "node:fs";
 import path from "node:path";
 import WebSocketClient from "ws";
@@ -135,108 +134,6 @@ function extractIntents(text) {
 	return out;
 }
 
-function wrapLine(line, width) {
-	if (width <= 0) return [""];
-	if (!line) return [""];
-	const out = [];
-	const logicalLines = String(line).split(/\r?\n/);
-	for (const logical of logicalLines) {
-		if (!logical) {
-			out.push("");
-			continue;
-		}
-		let s = logical;
-		while (s.length > width) {
-			out.push(s.slice(0, width));
-			s = s.slice(width);
-		}
-		out.push(s);
-	}
-	return out.length > 0 ? out : [""];
-}
-
-function singleLine(line) {
-	return String(line).replace(/\r?\n/g, " ");
-}
-
-function padOrTrimToWidth(text, width) {
-	const clipped = truncateToWidth(String(text || ""), width, "", false);
-	const w = visibleWidth(clipped);
-	return w < width ? clipped + " ".repeat(width - w) : clipped;
-}
-
-class TwoPaneLogs {
-	constructor(terminal, state) {
-		this.terminal = terminal;
-		this.state = state;
-	}
-
-	invalidate() {}
-
-	render(width) {
-		const rows = Math.max(8, this.terminal.rows - 4);
-		const singlePane = this.state.speechDisabled || this.state.actionDisabled;
-
-		if (singlePane) {
-			const panelWidth = Math.max(16, width);
-			const isSpeech = !this.state.speechDisabled;
-			const logLines = isSpeech ? this.state.speechLines : this.state.actionLines;
-			const liveLine = isSpeech ? this.state.speechLiveLine : this.state.actionLiveLine;
-			const pinnedUser = isSpeech ? this.state.speechPinnedUser : this.state.actionPinnedUser;
-			const busy = isSpeech ? this.state.speechBusy : this.state.actionBusy;
-			const label = isSpeech ? "Speech" : "Action";
-
-			const all = [];
-			for (const line of logLines) all.push(...wrapLine(line, panelWidth));
-			if (liveLine) all.push(...wrapLine(liveLine, panelWidth));
-			const pinned = pinnedUser ? singleLine(pinnedUser) : "";
-
-			const bodyRows = Math.max(1, rows - 1);
-			const visible = [...all.slice(-bodyRows), pinned];
-			const count = Math.max(visible.length, rows);
-
-			const status = busy ? "busy" : "idle";
-			const lines = [padOrTrimToWidth(` ${label} (${status}) `, panelWidth)];
-			for (let i = 0; i < count; i++) {
-				lines.push(padOrTrimToWidth(visible[i] || "", panelWidth));
-			}
-			return lines;
-		}
-
-		const sep = " | ";
-		const panelWidth = Math.max(16, Math.floor((width - sep.length) / 2));
-
-		const leftAll = [];
-		for (const line of this.state.speechLines) leftAll.push(...wrapLine(line, panelWidth));
-		if (this.state.speechLiveLine) leftAll.push(...wrapLine(this.state.speechLiveLine, panelWidth));
-		const pinnedLeftLine = this.state.speechPinnedUser ? singleLine(this.state.speechPinnedUser) : "";
-
-		const rightAll = [];
-		for (const line of this.state.actionLines) rightAll.push(...wrapLine(line, panelWidth));
-		if (this.state.actionLiveLine) rightAll.push(...wrapLine(this.state.actionLiveLine, panelWidth));
-		const pinnedRightLine = this.state.actionPinnedUser ? singleLine(this.state.actionPinnedUser) : "";
-
-		const bodyRows = Math.max(1, rows - 1);
-		const left = [...leftAll.slice(-bodyRows), pinnedLeftLine];
-		const right = [...rightAll.slice(-bodyRows), pinnedRightLine];
-		const count = Math.max(left.length, right.length, rows);
-
-		const speechStatus = this.state.speechDisabled ? "disabled" : this.state.speechBusy ? "busy" : "idle";
-		const actionStatus = this.state.actionDisabled ? "disabled" : this.state.actionBusy ? "busy" : "idle";
-		const headerLeft = ` Speech (${speechStatus}) `;
-		const headerRight = ` Action (${actionStatus}) `;
-		const header = padOrTrimToWidth(headerLeft, panelWidth) + sep + padOrTrimToWidth(headerRight, panelWidth);
-
-		const lines = [header];
-		for (let i = 0; i < count; i++) {
-			const l = padOrTrimToWidth(left[i] || "", panelWidth);
-			const r = padOrTrimToWidth(right[i] || "", panelWidth);
-			lines.push(l + sep + r);
-		}
-		return lines;
-	}
-}
-
 // Sentence-boundary punctuation and limits for incremental TTS chunking.
 const _TTS_PUNCT = [".", "!", "?", "\n", ":", ";"];
 const _TTS_MIN_SENTENCE_CHARS = 24;
@@ -366,11 +263,11 @@ class ElevenLabsMultiContextPlayer {
 		}
 	}
 
-	_completeContext(contextId) {
+	_completeContext(contextId, speechText) {
 		const ctxState = this.contextStates.get(contextId);
 		if (!ctxState || ctxState.doneSent) return;
 		ctxState.doneSent = true;
-		void this._sendChunk(contextId, ctxState.chunkCount, "", true);
+		void this._sendChunk(contextId, ctxState.chunkCount, "", true, speechText);
 		if (ctxState.resolve) ctxState.resolve();
 	}
 
@@ -405,12 +302,18 @@ class ElevenLabsMultiContextPlayer {
 
 	// --- Incremental streaming API (matches audio.py pattern) ---
 
+	/** Pre-set the context ID for the next streaming context (used to correlate with PlaySpeech). */
+	setNextContextId(id) {
+		this._pendingContextId = id;
+	}
+
 	/** Send a text chunk from the LLM stream. Accumulates and sends at sentence boundaries. */
 	sendTextChunk(chunk) {
 		if (this.closed || !this.wsReady || !chunk) return;
 		// Open a new context on first chunk
 		if (!this._streamingCtx) {
-			const contextId = `ctx_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+			const contextId = this._pendingContextId || `ctx_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+			this._pendingContextId = null;
 			this._streamingCtx = contextId;
 			this._streamingBuffer = "";
 			this.currentContextId = contextId;
@@ -436,7 +339,7 @@ class ElevenLabsMultiContextPlayer {
 	}
 
 	/** Flush the current streaming context: send remaining text + flush signal, wait for audio to finish. */
-	async flushStream({ trimMs = 0 } = {}) {
+	async flushStream({ speechText } = {}) {
 		const contextId = this._streamingCtx;
 		if (!contextId) return;
 		this._streamingCtx = null;
@@ -461,7 +364,7 @@ class ElevenLabsMultiContextPlayer {
 			if (ctxState.chunkCount > 0 && Date.now() - ctxState.lastChunkTime > 1500) {
 				debugLog(`flushStream ctx=${contextId} silence-done after ${ctxState.chunkCount} chunks`);
 				clearInterval(silenceCheck);
-				this._completeContext(contextId);
+				this._completeContext(contextId, speechText);
 			}
 		}, 200);
 
@@ -470,19 +373,7 @@ class ElevenLabsMultiContextPlayer {
 
 		if (!ctxState.doneSent) {
 			debugLog(`flushStream ctx=${contextId} timeout after ${ctxState.chunkCount} chunks`);
-			this._completeContext(contextId);
-		}
-		// Wait for estimated browser playback to complete
-		// PCM 24kHz 16-bit: durationMs = base64Len / 64
-		if (ctxState.playbackStartTime > 0 && ctxState.totalAudioLen > 0) {
-			const playbackMs = ctxState.totalAudioLen / 64;
-			const elapsed = Date.now() - ctxState.playbackStartTime;
-			const remaining = playbackMs - trimMs - elapsed;
-			if (remaining > 0) {
-				debugLog(`flushStream ctx=${contextId} waiting ${Math.round(remaining)}ms for playback (total ${Math.round(playbackMs)}ms)`);
-				await sleep(remaining);
-			}
-			debugLog(`flushStream ctx=${contextId} audio-end (duration=${Math.round(playbackMs)}ms, chunks=${ctxState.chunkCount})`);
+			this._completeContext(contextId, speechText);
 		}
 
 		this.contextStates.delete(contextId);
@@ -512,15 +403,17 @@ class ElevenLabsMultiContextPlayer {
 		this.currentContextId = null;
 	}
 
-	async _sendChunk(streamId, seq, data, done) {
+	async _sendChunk(streamId, seq, data, done, speechText) {
 		try {
+			const body = { stream_id: streamId, seq, data, done };
+			if (done && speechText) body.speech_text = speechText;
 			await fetch(this.audioUrl, {
 				method: "POST",
 				headers: {
 					"X-Session": this.sessionToken,
 					"Content-Type": "application/json",
 				},
-				body: JSON.stringify({ stream_id: streamId, seq, data, done }),
+				body: JSON.stringify(body),
 			});
 		} catch (err) {
 			debugLog(`sendChunk error: ${err instanceof Error ? err.message : String(err)}`);
@@ -581,13 +474,21 @@ async function fetchJson(url, init = {}) {
 	return await res.json();
 }
 
+function buildSpectateWsUrl(baseUrl) {
+	const url = new URL(baseUrl);
+	url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+	url.pathname = "/spectate/ws";
+	url.search = "";
+	url.hash = "";
+	return url.toString();
+}
+
 loadDotEnvFromCwdAndParents();
 
 const argv = process.argv.slice(2);
 const cliFlags = new Set(argv.filter((a) => a.startsWith("--") && !a.includes("=")));
 const cliNameArg = argv.find((a) => a.startsWith("--name="))?.split("=")[1]
 	|| argv[argv.indexOf("--name") + 1];
-const playbackTrimMs = Number(argv.find((a) => a.startsWith("--playback-trim="))?.split("=")[1] ?? 2000);
 const cliDir = argv.find((a) => a.startsWith("--dir="))?.split("=")[1]
 	|| argv[argv.indexOf("--dir") + 1];
 
@@ -831,7 +732,7 @@ let speechIntentBuffer = [];
 let speechStreamText = "";
 let ttsInsideSpeak = false; // true while accumulating text inside <speak>/<s> tag
 let ttsSpeakAccum = ""; // full text of current speak segment (for speech channel + logging)
-let ttsSpeakClaimPromise = null; // promise from claimSpeaking() for current speak segment
+let ttsSpeakStreamId = null; // stream_id for PlaySpeech claim of current speak segment
 
 function startActionIdleTimer() {
 	stopActionIdleTimer();
@@ -865,25 +766,26 @@ const audioPlayer =
 			})
 		: null;
 
-const terminal = new ProcessTerminal();
-const tui = new TUI(terminal, true);
-const split = new TwoPaneLogs(terminal, state);
-const inputBox = new Input();
+function requestRender() {}
 
 function trimBuffer(arr, max = 200) {
 	if (arr.length > max) arr.splice(0, arr.length - max);
 }
 
 function addSpeechLine(text) {
-	state.speechLines.push(`[${now()}] ${text}`);
+	const line = `[${now()}] [speech] ${text}`;
+	state.speechLines.push(line);
 	trimBuffer(state.speechLines);
-	tui.requestRender();
+	console.log(line);
+	requestRender();
 }
 
 function addActionLine(text) {
-	state.actionLines.push(`[${now()}] ${text}`);
+	const line = `[${now()}] [action] ${text}`;
+	state.actionLines.push(line);
 	trimBuffer(state.actionLines);
-	tui.requestRender();
+	console.log(line);
+	requestRender();
 }
 
 function persistSpeechConversation() {
@@ -897,28 +799,28 @@ function persistActionConversation() {
 async function runSpeechPrompt(text) {
 	if (disableSpeechAgent || isClosing || state.speechBusy) return;
 	state.speechBusy = true;
-	tui.requestRender();
+	requestRender();
 	try {
 		await speechAgent.prompt(text);
 	} catch (error) {
 		addSpeechLine(`[error] ${error instanceof Error ? error.message : String(error)}`);
 	} finally {
 		state.speechBusy = false;
-		tui.requestRender();
+		requestRender();
 	}
 }
 
 async function runSpeechContinue() {
 	if (disableSpeechAgent || isClosing || state.speechBusy) return;
 	state.speechBusy = true;
-	tui.requestRender();
+	requestRender();
 	try {
 		await speechAgent.continue();
 	} catch (error) {
 		addSpeechLine(`[error] ${error instanceof Error ? error.message : String(error)}`);
 	} finally {
 		state.speechBusy = false;
-		tui.requestRender();
+		requestRender();
 	}
 }
 
@@ -929,7 +831,7 @@ async function runActionContinue() {
 	state.actionLiveLine = "";
 	lastActionActivityAt = Date.now();
 	startActionIdleTimer();
-	tui.requestRender();
+	requestRender();
 	try {
 		await actionAgent.continue();
 	} catch (error) {
@@ -938,7 +840,7 @@ async function runActionContinue() {
 		state.actionBusy = false;
 		state.actionLiveLine = "";
 		stopActionIdleTimer();
-		tui.requestRender();
+		requestRender();
 	}
 }
 
@@ -949,7 +851,7 @@ async function runActionPrompt(text) {
 	state.actionLiveLine = "";
 	lastActionActivityAt = Date.now();
 	startActionIdleTimer();
-	tui.requestRender();
+	requestRender();
 	try {
 		await actionAgent.prompt(text);
 	} catch (error) {
@@ -958,7 +860,7 @@ async function runActionPrompt(text) {
 		state.actionBusy = false;
 		state.actionLiveLine = "";
 		stopActionIdleTimer();
-		tui.requestRender();
+		requestRender();
 	}
 }
 
@@ -972,40 +874,32 @@ async function fetchObserve() {
 
 async function postSpeechToServer(text) {
 	if (!worldSession) return;
+	const cleaned = String(text || "").trim();
+	if (!cleaned) return;
 	try {
 		await fetch(`${worldBaseUrl}/speech`, {
 			method: "POST",
 			headers: { "X-Session": worldSession, "Content-Type": "application/json" },
-			body: JSON.stringify({ text }),
+			body: JSON.stringify({ text: cleaned }),
 		});
 	} catch (err) {
-		console.error(`[speech] post error: ${err instanceof Error ? err.message : String(err)}`);
+		debugLog(`[speech] post error: ${err instanceof Error ? err.message : String(err)}`);
 	}
 }
 
-async function claimSpeaking() {
+async function sendPlaySpeech(streamId) {
 	const res = await fetch(`${worldBaseUrl}/input`, {
 		method: "POST",
 		headers: { "X-Session": worldSession, "Content-Type": "application/json" },
-		body: JSON.stringify({ type: "ClaimSpeaking" }),
+		body: JSON.stringify({ type: "PlaySpeech", data: { stream_id: streamId } }),
 	});
-	if (!res.ok) throw new Error(`ClaimSpeaking failed: ${res.status} ${res.statusText}`);
+	if (!res.ok) throw new Error(`PlaySpeech failed: ${res.status} ${res.statusText}`);
 	const obs = await res.json();
 	const claimed = obs?.player?.attributes?.IsSpeaking === true;
-	debugLog(`claimSpeaking: claimed=${claimed} player_attrs=${JSON.stringify(obs?.player?.attributes)}`);
-	return claimed;
-}
-
-async function releaseSpeaking() {
-	try {
-		await fetch(`${worldBaseUrl}/input`, {
-			method: "POST",
-			headers: { "X-Session": worldSession, "Content-Type": "application/json" },
-			body: JSON.stringify({ type: "ReleaseSpeaking" }),
-		});
-	} catch (err) {
-		debugLog(`releaseSpeaking error: ${err instanceof Error ? err.message : String(err)}`);
+	if (!claimed) {
+		debugLog(`sendPlaySpeech: claim rejected for stream ${streamId}`);
 	}
+	return claimed;
 }
 
 function injectObserveForSpeech(observation) {
@@ -1086,33 +980,85 @@ function injectSpeechForAction(intents) {
 	}
 }
 
-let speechPollActive = false;
+let speechWs = null;
+let speechWsActive = false;
+let speechWsReconnectTimer = null;
+let speechLastSeq = 0;
 
-async function speechPollLoop() {
-	speechPollActive = true;
-	let lastSeq = 0;
-	while (!isClosing && speechPollActive) {
+function scheduleSpeechWsReconnect() {
+	if (!speechWsActive || isClosing || speechWsReconnectTimer) return;
+	speechWsReconnectTimer = setTimeout(() => {
+		speechWsReconnectTimer = null;
+		connectSpeechWs();
+	}, 1000);
+}
+
+function handleSpeechEvent(ev) {
+	if (!ev || ev.type !== "speech") return;
+	const seq = Number(ev.seq);
+	if (Number.isFinite(seq) && seq > 0) {
+		if (seq <= speechLastSeq) return;
+		speechLastSeq = seq;
+	}
+	if (ev.speaker === worldAgentName) return;
+	addSpeechLine(`[heard] ${ev.speaker}: ${ev.text}`);
+	speechAgent.steer({
+		role: "user",
+		content: [{ type: "text", text: `[${ev.speaker} says]: ${ev.text}` }],
+		timestamp: Date.now(),
+	});
+	if (!state.speechBusy) void runSpeechContinue();
+}
+
+function connectSpeechWs() {
+	if (!speechWsActive || isClosing || !worldSession) return;
+	const wsUrl = buildSpectateWsUrl(worldBaseUrl);
+	const ws = new WebSocketClient(wsUrl, { headers: { "X-Session": worldSession } });
+	speechWs = ws;
+
+	ws.on("open", () => {
+		if (speechWs !== ws) return;
+		addSpeechLine(`[speech-ws] connected ${wsUrl}`);
+	});
+
+	ws.on("message", (raw) => {
+		if (speechWs !== ws) return;
 		try {
-			const res = await fetch(`${worldBaseUrl}/speech?after=${lastSeq}&wait=true`, {
-				headers: { "X-Session": worldSession },
-			});
-			if (!res.ok) { await sleep(1000); continue; }
-			const data = await res.json();
-			for (const ev of data.events) {
-				if (ev.speaker === worldAgentName) continue;
-				lastSeq = Math.max(lastSeq, ev.seq);
-				addSpeechLine(`[heard] ${ev.speaker}: ${ev.text}`);
-				speechAgent.steer({
-					role: "user",
-					content: [{ type: "text", text: `[${ev.speaker} says]: ${ev.text}` }],
-					timestamp: Date.now(),
-				});
-				if (!state.speechBusy) void runSpeechContinue();
-			}
-			if (data.last_seq > lastSeq) lastSeq = data.last_seq;
-		} catch (err) {
-			if (!isClosing) await sleep(1000);
+			const text = typeof raw === "string" ? raw : Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw);
+			const parsed = JSON.parse(text);
+			handleSpeechEvent(parsed);
+		} catch {
+			// Ignore non-JSON / non-speech messages (state snapshots, binary, etc.).
 		}
+	});
+
+	ws.on("close", () => {
+		if (speechWs === ws) speechWs = null;
+		if (speechWsActive && !isClosing) scheduleSpeechWsReconnect();
+	});
+
+	ws.on("error", (err) => {
+		if (speechWs !== ws) return;
+		debugLog(`[speech-ws] error: ${err instanceof Error ? err.message : String(err)}`);
+	});
+}
+
+function startSpeechWsLoop() {
+	speechWsActive = true;
+	connectSpeechWs();
+}
+
+function stopSpeechWsLoop() {
+	speechWsActive = false;
+	if (speechWsReconnectTimer) {
+		clearTimeout(speechWsReconnectTimer);
+		speechWsReconnectTimer = null;
+	}
+	if (speechWs) {
+		try {
+			speechWs.close();
+		} catch {}
+		speechWs = null;
 	}
 }
 
@@ -1144,54 +1090,62 @@ speechAgent.subscribe((event) => {
 		speechStreamText = "";
 		ttsInsideSpeak = false;
 		ttsSpeakAccum = "";
-		ttsSpeakClaimPromise = null;
+		ttsSpeakStreamId = null;
 		state.speechLiveLine = "assistant>";
-		tui.requestRender();
+		requestRender();
 		return;
 	}
-	if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-		const delta = event.assistantMessageEvent.delta;
-		state.speechLiveLine += delta;
-		speechStreamText += delta;
+		if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+			const delta = event.assistantMessageEvent.delta;
+			state.speechLiveLine += delta;
+			speechStreamText += delta;
 
 		// Stream text inside <speak>/<s> tags directly to TTS as it arrives.
 		// We parse the accumulated buffer for open/close tags and send inner text incrementally.
-		while (speechStreamText.length > 0) {
-			if (!ttsInsideSpeak) {
-				// Look for an opening tag
-				const openMatch = speechStreamText.match(/<(?:speak|s)>/);
-				if (!openMatch) break; // no opening tag yet, wait for more deltas
-				// Discard everything before and including the opening tag
-				speechStreamText = speechStreamText.slice(openMatch.index + openMatch[0].length);
-				ttsInsideSpeak = true;
-				ttsSpeakAccum = "";
-				ttsSpeakClaimPromise = claimSpeaking();
-			}
-			// We're inside a speak tag — look for closing tag
-			const closeMatch = speechStreamText.match(/<\/(?:speak|s)>/);
-			if (closeMatch) {
-				const inner = speechStreamText.slice(0, closeMatch.index);
-				if (inner) audioPlayer?.sendTextChunk(inner);
-				ttsSpeakAccum += inner;
-				speechStreamText = speechStreamText.slice(closeMatch.index + closeMatch[0].length);
-				ttsInsideSpeak = false;
-				addSpeechLine(`[speak] ${ttsSpeakAccum.slice(0, 80)}`);
-				const spokenText = ttsSpeakAccum;
-				ttsSpeakAccum = "";
-				const claimP = ttsSpeakClaimPromise;
-				ttsSpeakClaimPromise = null;
-				const flushP = audioPlayer?.flushStream({ trimMs: playbackTrimMs });
-				(claimP || Promise.resolve(true)).then(async (claimed) => {
-					if (!claimed) { audioPlayer?.interrupt(); return; }
-					await (flushP || Promise.resolve());
-					postSpeechToServer(spokenText);
-					if (playbackTrimMs > 0) await sleep(playbackTrimMs);
-					releaseSpeaking();
-				});
-			} else {
-				// No closing tag yet — send what we have so far as incremental text
-				if (speechStreamText.length > 0) {
-					audioPlayer?.sendTextChunk(speechStreamText);
+			while (speechStreamText.length > 0) {
+				if (!ttsInsideSpeak) {
+					// Look for an opening tag
+					const openMatch = speechStreamText.match(/<(?:speak|s)>/);
+					if (!openMatch) {
+						// Keep a short tail so split tags across deltas can still be detected.
+						if (speechStreamText.length > 32) {
+							speechStreamText = speechStreamText.slice(-32);
+						}
+						break;
+					}
+					// Discard everything before and including the opening tag
+					speechStreamText = speechStreamText.slice(openMatch.index + openMatch[0].length);
+					ttsInsideSpeak = true;
+					// Use one stream per assistant message (even with multiple <speak> tags)
+					// to avoid overlapping playback between segments.
+					if (!ttsSpeakStreamId) {
+						ttsSpeakAccum = "";
+						ttsSpeakStreamId = `ctx_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+						audioPlayer?.setNextContextId(ttsSpeakStreamId);
+						sendPlaySpeech(ttsSpeakStreamId).then(claimed => {
+							if (!claimed) {
+								debugLog(`Speech claim rejected for stream ${ttsSpeakStreamId}, interrupting audio`);
+								audioPlayer?.interrupt();
+							}
+						});
+					} else if (ttsSpeakAccum.length > 0 && !ttsSpeakAccum.endsWith("\n\n")) {
+						// Add a small pause between speak-tag segments while keeping one stream.
+						audioPlayer?.sendTextChunk("\n\n");
+						ttsSpeakAccum += "\n\n";
+					}
+				}
+				// We're inside a speak tag — look for closing tag
+				const closeMatch = speechStreamText.match(/<\/(?:speak|s)>/);
+				if (closeMatch) {
+					const inner = speechStreamText.slice(0, closeMatch.index);
+					if (inner) audioPlayer?.sendTextChunk(inner);
+					ttsSpeakAccum += inner;
+					speechStreamText = speechStreamText.slice(closeMatch.index + closeMatch[0].length);
+					ttsInsideSpeak = false;
+				} else {
+					// No closing tag yet — send what we have so far as incremental text
+					if (speechStreamText.length > 0) {
+						audioPlayer?.sendTextChunk(speechStreamText);
 					ttsSpeakAccum += speechStreamText;
 				}
 				speechStreamText = "";
@@ -1199,50 +1153,43 @@ speechAgent.subscribe((event) => {
 			}
 		}
 
-		tui.requestRender();
+		requestRender();
 		return;
 	}
-	if (event.type === "message_end" && event.message.role === "assistant") {
+		if (event.type === "message_end" && event.message.role === "assistant") {
 		const fullText = event.message.content.filter((c) => c.type === "text").map((c) => c.text).join("");
 		if (fullText.trim().length > 0) addSpeechLine(`assistant> ${fullText}`);
 		const err = event.message.errorMessage;
 		if (err) addSpeechLine(`[error] ${err}`);
 
-		// Flush any remaining text if LLM ended mid-speak
-		if (ttsInsideSpeak) {
-			if (speechStreamText.trim()) {
-				audioPlayer?.sendTextChunk(speechStreamText);
-				ttsSpeakAccum += speechStreamText;
+			// Flush any remaining text if LLM ended mid-speak or with buffered speak stream.
+			if (ttsSpeakStreamId) {
+				if (ttsInsideSpeak && speechStreamText.trim()) {
+					audioPlayer?.sendTextChunk(speechStreamText);
+					ttsSpeakAccum += speechStreamText;
+				}
+				const spokenText = ttsSpeakAccum;
+				if (spokenText.trim()) {
+					addSpeechLine(`[speak] ${spokenText.slice(0, 80)}`);
+					// Publish text immediately for renderer/agent visibility.
+					// audio_done remains the signal for turn release.
+					void postSpeechToServer(spokenText);
+					audioPlayer?.flushStream();
+				} else {
+					audioPlayer?.flushStream();
+				}
 			}
-			const spokenText = ttsSpeakAccum;
-			const claimP = ttsSpeakClaimPromise;
-			ttsSpeakClaimPromise = null;
-			if (spokenText.trim()) {
-				addSpeechLine(`[speak] ${spokenText.slice(0, 80)}`);
-				const flushP = audioPlayer?.flushStream({ trimMs: playbackTrimMs });
-				(claimP || Promise.resolve(true)).then(async (claimed) => {
-					if (!claimed) { audioPlayer?.interrupt(); return; }
-					await (flushP || Promise.resolve());
-					postSpeechToServer(spokenText);
-					if (playbackTrimMs > 0) await sleep(playbackTrimMs);
-					releaseSpeaking();
-				});
-			} else {
-				audioPlayer?.flushStream();
-				if (claimP) claimP.then(claimed => { if (claimed) releaseSpeaking(); });
-			}
-		}
 		speechStreamText = "";
 		ttsInsideSpeak = false;
 		ttsSpeakAccum = "";
-		ttsSpeakClaimPromise = null;
+		ttsSpeakStreamId = null;
 
 		const intents = extractIntents(fullText);
 		if (intents.length > 0) speechIntentBuffer.push(...intents);
 
 		state.speechLiveLine = "";
 		state.speechPinnedUser = "";
-		tui.requestRender();
+		requestRender();
 	}
 	if (event.type === "turn_end") {
 		if (speechIntentBuffer.length > 0) {
@@ -1259,7 +1206,7 @@ actionAgent.subscribe((event) => {
 		actionSawDelta = false;
 		actionStreamText = "";
 		state.actionLiveLine = "assistant>";
-		tui.requestRender();
+		requestRender();
 		return;
 	}
 	if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
@@ -1276,7 +1223,7 @@ actionAgent.subscribe((event) => {
 			if (!state.speechBusy) void runSpeechContinue();
 		}
 
-		tui.requestRender();
+		requestRender();
 		return;
 	}
 	if (event.type === "message_update" && event.assistantMessageEvent.type === "toolcall_end") {
@@ -1288,157 +1235,50 @@ actionAgent.subscribe((event) => {
 		if (txt) addActionLine(`assistant> ${txt}`);
 		state.actionLiveLine = "";
 		state.actionPinnedUser = "";
-		tui.requestRender();
+		requestRender();
 	}
 });
 
-async function handleCommand(line) {
-	if (line === "/quit" || line === "/exit") {
-		isClosing = true;
-		speechPollActive = false;
+async function shutdown(reason = "signal") {
+	if (isClosing) return;
+	isClosing = true;
+	addActionLine(`Shutting down (${reason})...`);
+
+	stopObserveLoop();
+	stopSpeechWsLoop();
+	stopActionIdleTimer();
+	try {
+		audioPlayer?.interrupt();
+	} catch {}
+	try {
 		audioPlayer?.close();
-		persistSpeechConversation();
-		persistActionConversation();
-		tui.stop();
-		process.exit(0);
-		return;
-	}
-	if (line === "/reset") {
-		if (state.speechBusy) speechAgent.abort();
-		if (state.actionBusy) actionAgent.abort();
-		speechAgent.reset();
-		actionAgent.reset();
-		speechAgent.setSystemPrompt(speechSystemPrompt);
-		actionAgent.setSystemPrompt(buildActionSystemPrompt());
-		lastObservation = null;
-		actionStreamText = "";
-		lastActionActivityAt = 0;
-		stopActionIdleTimer();
-		speechIntentBuffer = [];
-		addSpeechLine("Context cleared.");
-		return;
-	}
-	if (line === "/session") {
-		addActionLine(`session=${worldSession}`);
-		return;
-	}
-	if (line === "/observe status") {
-		addSpeechLine(`observe=${observeLoopEnabled ? "on" : "off"} interval=${observeIntervalMs}ms session=${worldSession ? "set" : "missing"}`);
-		return;
-	}
-	if (line === "/observe on") {
-		if (!observeLoopEnabled) startObserveLoop();
-		addSpeechLine(`observe=on (${observeIntervalMs}ms)`);
-		return;
-	}
-	if (line === "/observe off") {
-		observeLoopEnabled = false;
-		stopObserveLoop();
-		addSpeechLine("observe=off");
-		return;
-	}
-	if (line === "/observe once") {
-		try {
-			const obs = await fetchObserve();
-			if (obs) {
-				injectObserveForSpeech(obs);
-				if (!state.speechBusy && speechAgent.state.messages.length > 0) void runSpeechContinue();
-				addSpeechLine("observe=once queued");
-			}
-		} catch (error) {
-			addSpeechLine(`[observe] error: ${error instanceof Error ? error.message : String(error)}`);
-		}
-		return;
-	}
-	if (line.startsWith("/a ")) {
-		const text = line.slice(3).trim();
-		if (!text) return;
-		state.actionPinnedUser = `you> ${text}`;
-		addActionLine(`you> ${text}`);
-		if (state.actionBusy) {
-			addActionLine("Still processing previous request.");
-			return;
-		}
-		void runActionPrompt(text);
-		return;
-	}
-	if (line === "/a") {
-		addActionLine("Usage: /a <message>");
-		return;
-	}
-	if (line.startsWith("/s ")) {
-		const text = line.slice(3).trim();
-		if (!text) return;
-		state.speechPinnedUser = `you> ${text}`;
-		addSpeechLine(`you> ${text}`);
-		if (state.speechBusy) {
-			speechAgent.steer({ role: "user", content: [{ type: "text", text }], timestamp: Date.now() });
-			addSpeechLine("Queued steer message.");
-			return;
-		}
-		const userMessage = { role: "user", content: [{ type: "text", text }], timestamp: Date.now() };
-		if (speechAgent.state.messages.length === 0) {
-			speechAgent.appendMessage(userMessage);
-		} else {
-			speechAgent.steer(userMessage);
-		}
-		void runSpeechContinue();
-		return;
-	}
-	if (line === "/s") {
-		addSpeechLine("Usage: /s <message>");
-		return;
-	}
+	} catch {}
 
 	if (state.speechBusy) {
-		state.speechPinnedUser = `you> ${line}`;
-		addSpeechLine(`you> ${line}`);
-		speechAgent.steer({ role: "user", content: [{ type: "text", text: line }], timestamp: Date.now() });
-		addSpeechLine("Queued steer message.");
-		return;
+		try { speechAgent.abort(); } catch {}
+		state.speechBusy = false;
+	}
+	if (state.actionBusy) {
+		try { actionAgent.abort(); } catch {}
+		state.actionBusy = false;
 	}
 
-	state.speechPinnedUser = `you> ${line}`;
-	addSpeechLine(`you> ${line}`);
-	const userMessage = { role: "user", content: [{ type: "text", text: line }], timestamp: Date.now() };
-	if (speechAgent.state.messages.length === 0) {
-		speechAgent.appendMessage(userMessage);
-	} else {
-		speechAgent.steer(userMessage);
-	}
-	void runSpeechContinue();
+	persistSpeechConversation();
+	persistActionConversation();
 }
 
-tui.addChild(split);
-tui.addChild(inputBox);
-tui.setFocus(inputBox);
-
-inputBox.onSubmit = (value) => {
-	const line = value.trim();
-	inputBox.setValue("");
-	if (!line) {
-		tui.requestRender();
-		return;
-	}
-	void handleCommand(line);
-};
-
 process.on("SIGINT", () => {
-	if (state.speechBusy || state.actionBusy) {
-		speechAgent.abort();
-		actionAgent.abort();
-		state.speechBusy = false;
-		state.actionBusy = false;
-		addSpeechLine("Aborted.");
-		return;
-	}
-	void handleCommand("/quit");
+	void shutdown("SIGINT").finally(() => process.exit(0));
+});
+
+process.on("SIGTERM", () => {
+	void shutdown("SIGTERM").finally(() => process.exit(0));
 });
 
 addActionLine(`Dual-agent ready with model "${modelName}" (${modelProvider}).`);
 addActionLine(`World joined: ${worldBaseUrl} agent=${worldAgentName}`);
 addActionLine(`Session key: ${worldSession}`);
-addSpeechLine("Commands: /reset, /quit, /session, /observe on|off|status|once, /a <msg>, /s <msg> (plain text goes to speech)");
+addSpeechLine("Non-interactive mode enabled (plain logs, no TUI).");
 if (disableSpeechAgent) {
 	addSpeechLine("Speech agent disabled (--no-speech).");
 }
@@ -1457,9 +1297,7 @@ if (audioPlayer) {
 }
 
 // startObserveLoop();  // Disabled: speech agent now receives observations via action agent tool call injection
-void speechPollLoop();
-
-tui.start();
+startSpeechWsLoop();
 
 if (!disableActionAgent) void runActionPrompt("Fetch the skill commands and observe the world.");
 if (!disableSpeechAgent) void runSpeechPrompt(agentConfig.initial_prompt || "You have just woken up in the world.");

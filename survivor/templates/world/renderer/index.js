@@ -1,17 +1,81 @@
 /* ───────────────────────────────────────────────────────
    Tribal Council — Live Visual-Novel Renderer
-   Replaces Three.js renderer with DOM-based overlay
+   Persona-style large portraits with mood-based expressions,
    driven by spectator WS speech events + onState player data.
    ─────────────────────────────────────────────────────── */
 
 // ── Character data ──────────────────────────────────────
 const CHARACTERS = {
-  host:          { name: 'Jeff',          color: '#b8860b' },
-  rodger_dodger: { name: 'Rodger Dodger', color: '#8B4513', portrait: '/assets/rodger-calm.JPG' },
-  yasmin:        { name: 'Yasmin',        color: '#E74C3C' },
-  guy:           { name: 'Guy',           color: '#3498DB' },
-  stephanie:     { name: 'Stephanie',     color: '#9B59B6' },
-  tommy:         { name: 'Tommy',         color: '#27AE60' },
+  host: {
+    name: 'Jeff',
+    color: '#b8860b',
+    expressions: ['neutral', 'serious', 'intrigued'],
+    assets: {
+      neutral:   '/assets/host.png',
+      serious:   '/assets/host.png',
+      intrigued: '/assets/host.png',
+    },
+  },
+  rodger_dodger: {
+    name: 'Rodger Dodger',
+    color: '#8B4513',
+    expressions: ['stoic', 'smug', 'angry', 'hurt', 'proud'],
+    assets: {
+      stoic:  '/assets/roger.png',
+      smug:   '/assets/roger-happy.png',
+      proud:  '/assets/roger.png',
+      angry:  '/assets/roger-angry.png',
+      hurt:   '/assets/roger-sad.png',
+    },
+  },
+  yasmin: {
+    name: 'Yasmin',
+    color: '#E74C3C',
+    expressions: ['smug', 'flirty', 'angry', 'composed', 'wounded'],
+    assets: {
+      smug:     '/assets/yasmin-happy.png',
+      flirty:   '/assets/yasmin-happy.png',
+      angry:    '/assets/yasmin-angry.png',
+      composed: '/assets/yasmin.png',
+      wounded:  '/assets/yasmin-sad.png',
+    },
+  },
+  guy: {
+    name: 'Guy',
+    color: '#3498DB',
+    expressions: ['smug', 'nervous', 'flustered', 'calculating', 'pleased'],
+    assets: {
+      smug:        '/assets/guy-happy.png',
+      nervous:     '/assets/guy-sad.png',
+      flustered:   '/assets/guy-sad.png',
+      calculating: '/assets/guy-angry.png',
+      pleased:     '/assets/guy-happy.png',
+    },
+  },
+  stephanie: {
+    name: 'Stephanie',
+    color: '#9B59B6',
+    expressions: ['anxious', 'hurt', 'suspicious', 'flustered', 'defiant'],
+    assets: {
+      anxious:    '/assets/stephanie-sad.png',
+      hurt:       '/assets/stephanie-sad.png',
+      suspicious: '/assets/stephanie.png',
+      flustered:  '/assets/stephanie-sad.png',
+      defiant:    '/assets/stephanie-angry.png',
+    },
+  },
+  tommy: {
+    name: 'Tommy',
+    color: '#27AE60',
+    expressions: ['stoic', 'angry', 'conflicted', 'protective', 'weary'],
+    assets: {
+      stoic:       '/assets/tommy.png',
+      angry:       '/assets/tommy-angry.png',
+      conflicted:  '/assets/tommy-sad.png',
+      protective:  '/assets/tommy-angry.png',
+      weary:       '/assets/tommy.png',
+    },
+  },
 }
 
 const CHAR_ORDER = ['host', 'rodger_dodger', 'yasmin', 'guy', 'stephanie', 'tommy']
@@ -43,34 +107,85 @@ const STYLES = `
   background: radial-gradient(ellipse at center, transparent 40%, rgba(0,0,0,0.55) 100%);
 }
 
-/* ── Character row ── */
+/* ── Character area (absolute positioned) ── */
 #sv-chars {
-  position: absolute; top: 0; left: 0; right: 0; bottom: 28%;
-  display: flex; align-items: flex-end; justify-content: center;
-  gap: 12px; padding: 0 24px 16px;
-  z-index: 10; pointer-events: none;
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  z-index: 10;
+  pointer-events: none;
 }
 
-.sv-char {
-  display: flex; flex-direction: column; align-items: center;
-  transition: filter 0.4s ease, transform 0.4s ease;
-  filter: brightness(0.35) saturate(0.5);
+/* ── Persona-style large portraits ── */
+.character-sprite {
+  position: absolute;
+  bottom: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  opacity: 0;
+  transition: opacity 0.4s ease, filter 0.4s ease, transform 0.4s ease;
+  filter: brightness(0.4) saturate(0.4);
   transform-origin: bottom center;
-  position: relative;
 }
-.sv-char.speaking {
-  filter: brightness(1) saturate(1) drop-shadow(0 0 18px rgba(255,140,40,0.5));
-  transform: scale(1.08);
+.character-sprite.visible {
+  opacity: 1;
+}
+.character-sprite.speaking {
+  filter: brightness(1) saturate(1);
   z-index: 15;
 }
-.sv-char.voted .sv-badge { display: flex; }
+.character-sprite:not(.speaking) {
+  filter: brightness(0.4) saturate(0.4);
+}
 
-/* Silhouette */
-.sv-sil {
-  width: 140px; height: 280px;
-  border-radius: 50px 50px 20px 20px;
-  display: flex; align-items: center; justify-content: center;
-  box-shadow: 0 0 30px rgba(0,0,0,0.5);
+.char-portrait {
+  position: relative;
+  height: 85vh;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+}
+.char-img {
+  height: 100%;
+  width: auto;
+  object-fit: contain;
+  filter: drop-shadow(0 4px 20px rgba(0,0,0,0.7));
+}
+
+/* ── Edge-based positioning ── */
+.character-sprite.pos-center {
+  left: 50%;
+  transform: translateX(-50%);
+}
+.character-sprite.pos-center.speaking {
+  transform: translateX(-50%) scale(1.03);
+}
+.character-sprite.pos-left {
+  left: -2%;
+  transform: translateX(0);
+}
+.character-sprite.pos-left.speaking {
+  transform: translateX(0) scale(1.03);
+}
+.character-sprite.pos-right {
+  right: -2%;
+  left: auto;
+  transform: translateX(0);
+}
+.character-sprite.pos-right.speaking {
+  transform: translateX(0) scale(1.03);
+}
+
+/* Silhouette fallback */
+.char-silhouette {
+  width: 240px;
+  height: 85vh;
+  border-radius: 70px 70px 30px 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  box-shadow: 0 0 40px rgba(0,0,0,0.6);
   clip-path: polygon(
     30% 0%, 70% 0%, 80% 8%, 85% 20%, 83% 35%,
     95% 45%, 100% 55%, 95% 65%, 80% 60%,
@@ -79,20 +194,6 @@ const STYLES = `
     5% 65%, 0% 55%, 5% 45%, 17% 35%,
     15% 20%, 20% 8%
   );
-}
-
-/* Portrait image (replaces silhouette) */
-.sv-portrait {
-  height: 280px; width: auto;
-  object-fit: contain;
-  filter: drop-shadow(0 4px 20px rgba(0,0,0,0.7));
-}
-
-.sv-name {
-  margin-top: 6px;
-  color: #fff; font-size: 13px; font-weight: bold;
-  text-shadow: 0 2px 6px rgba(0,0,0,0.9);
-  text-align: center;
 }
 
 /* Vote badge */
@@ -106,6 +207,7 @@ const STYLES = `
   box-shadow: 0 2px 8px rgba(0,0,0,0.6);
   z-index: 20;
 }
+.character-sprite.voted .sv-badge { display: flex; }
 
 /* ── Dialogue box ── */
 #sv-dlg {
@@ -153,24 +255,6 @@ const STYLES = `
   transition: width 0.4s ease;
 }
 
-/* ── Speech log ── */
-#sv-log {
-  position: absolute; top: 16px; left: 20px;
-  z-index: 30;
-  max-width: 340px; max-height: 40%;
-  overflow-y: auto; overflow-x: hidden;
-  display: flex; flex-direction: column; gap: 4px;
-  scrollbar-width: thin;
-  scrollbar-color: rgba(255,255,255,0.2) transparent;
-}
-.sv-log-entry {
-  font-size: 12px; line-height: 1.4;
-  color: rgba(255,255,255,0.45);
-  text-shadow: 0 1px 3px rgba(0,0,0,0.8);
-}
-.sv-log-name {
-  font-weight: bold;
-}
 
 /* ── Title overlay ── */
 #sv-title {
@@ -205,14 +289,27 @@ const STYLES = `
   100% { text-shadow: 0 0 60px rgba(255,120,20,0.8), 0 0 120px rgba(255,80,0,0.4), 0 4px 8px rgba(0,0,0,0.8); }
 }
 
+/* ── Screen shake ── */
+.shake-screen {
+  animation: screenShake 0.4s ease-out;
+}
+@keyframes screenShake {
+  0%, 100% { transform: translate(0, 0); }
+  15% { transform: translate(-3px, 1px); }
+  30% { transform: translate(3px, -1px); }
+  45% { transform: translate(-2px, 2px); }
+  60% { transform: translate(2px, -1px); }
+  75% { transform: translate(-1px, 1px); }
+}
+
 /* ── Responsive ── */
 @media (max-width: 768px) {
-  .sv-sil, .sv-portrait { width: 90px; height: 180px; }
+  .char-portrait { height: 75vh; }
+  .char-silhouette { width: 160px; height: 75vh; }
   #sv-dlg { height: 32%; padding: 14px 18px; }
   #sv-text { font-size: 15px; }
   #sv-speaker { font-size: 16px; }
   #sv-title h1 { font-size: 36px; letter-spacing: 6px; }
-  #sv-log { max-width: 220px; }
 }
 `
 
@@ -237,7 +334,6 @@ export function createRenderer(ctx) {
       <span id="sv-hud-label"></span>
       <div id="sv-hud-bar"><div id="sv-hud-fill"></div></div>
     </div>
-    <div id="sv-log"></div>
     <div id="sv-dlg">
       <div id="sv-speaker"></div>
       <div id="sv-text"></div>
@@ -255,7 +351,6 @@ export function createRenderer(ctx) {
   const $text     = root.querySelector('#sv-text')
   const $hudLabel = root.querySelector('#sv-hud-label')
   const $hudFill  = root.querySelector('#sv-hud-fill')
-  const $log      = root.querySelector('#sv-log')
   const $title    = root.querySelector('#sv-title')
 
   // ── State ──
@@ -263,10 +358,13 @@ export function createRenderer(ctx) {
   let playersHash = ''
   let titleVisible = true
   let typewriterTimer = null
+  let currentSpeaker = null   // agent name of current speaker
+  let previousSpeaker = null  // agent name of previous speaker
+  let hasSpeechStarted = false
 
   // ── Helpers ──
   function charData(agentName) {
-    return CHARACTERS[agentName] || { name: agentName, color: '#888' }
+    return CHARACTERS[agentName] || { name: agentName, color: '#888', expressions: [], assets: {} }
   }
 
   function hashPlayers(list) {
@@ -282,56 +380,126 @@ export function createRenderer(ctx) {
     return attrs && attrs.HasVoted === true
   }
 
+  // ── Asset helpers ──
+  function getAssetForMood(cd, mood) {
+    if (!cd.assets) return null
+    if (cd.assets[mood]) return cd.assets[mood]
+    // Fallback to calm/neutral, then first available
+    if (cd.assets.calm) return cd.assets.calm
+    if (cd.assets.neutral) return cd.assets.neutral
+    if (cd.assets.stoic) return cd.assets.stoic
+    if (cd.assets.composed) return cd.assets.composed
+    const vals = Object.values(cd.assets)
+    return vals.length > 0 ? vals[0] : null
+  }
+
+  function preloadAssets() {
+    for (const cd of Object.values(CHARACTERS)) {
+      if (!cd.assets) continue
+      for (const src of new Set(Object.values(cd.assets))) {
+        const img = new Image()
+        img.src = src
+      }
+    }
+  }
+
+  // ── Position character (Persona-style edge positioning) ──
+  function positionCharacter(el, index, total) {
+    if (total === 1) {
+      el.classList.add('pos-center')
+    } else if (total === 2) {
+      el.classList.add(index === 0 ? 'pos-left' : 'pos-right')
+    } else {
+      // Spread evenly
+      const spacing = 80 / (total + 1)
+      el.style.left = (10 + spacing * (index + 1)) + '%'
+      el.style.transform = 'translateX(-50%)'
+    }
+  }
+
+  // ── Build a character DOM element ──
+  function buildCharacterEl(agentName, isSpeaking, hasVoted) {
+    const cd = charData(agentName)
+    const mood = cd.expressions ? cd.expressions[0] : 'neutral'
+    const assetSrc = getAssetForMood(cd, mood)
+
+    const el = document.createElement('div')
+    el.className = 'character-sprite'
+    if (isSpeaking) el.classList.add('speaking')
+    if (hasVoted) el.classList.add('voted')
+
+    if (assetSrc) {
+      const portrait = document.createElement('div')
+      portrait.className = 'char-portrait'
+      const img = document.createElement('img')
+      img.className = 'char-img'
+      img.src = assetSrc
+      img.alt = cd.name
+      portrait.appendChild(img)
+      el.appendChild(portrait)
+    } else {
+      const sil = document.createElement('div')
+      sil.className = 'char-silhouette'
+      sil.style.backgroundColor = cd.color
+      el.appendChild(sil)
+    }
+
+    const badge = document.createElement('div')
+    badge.className = 'sv-badge'
+    badge.textContent = '\u2713'
+    el.appendChild(badge)
+
+    return el
+  }
+
   // ── Render characters ──
   function renderCharacters() {
     $chars.innerHTML = ''
-    // Order: show chars in CHAR_ORDER that exist in players, then any extras
+
+    if (!hasSpeechStarted) {
+      // Before any speech: show all characters spread out (initial council view)
+      const playerMap = new Map()
+      for (const p of players) playerMap.set(p.name, p)
+
+      const ordered = []
+      for (const key of CHAR_ORDER) {
+        if (playerMap.has(key)) ordered.push(playerMap.get(key))
+      }
+      for (const p of players) {
+        if (!CHAR_ORDER.includes(p.name)) ordered.push(p)
+      }
+
+      const total = ordered.length
+      ordered.forEach((p, i) => {
+        const isSpeaking = p.attributes?.IsSpeaking === true
+        const hasVoted = playerHasVoted(p)
+        const el = buildCharacterEl(p.name, isSpeaking, hasVoted)
+        positionCharacter(el, i, total)
+        $chars.appendChild(el)
+        requestAnimationFrame(() => el.classList.add('visible'))
+      })
+      return
+    }
+
+    // After speech started: show current speaker (left) and previous speaker (right)
+    const toShow = []
+    if (currentSpeaker) toShow.push({ name: currentSpeaker, isSpeaking: true })
+    if (previousSpeaker && previousSpeaker !== currentSpeaker) {
+      toShow.push({ name: previousSpeaker, isSpeaking: false })
+    }
+
+    // Find vote status from players list
     const playerMap = new Map()
     for (const p of players) playerMap.set(p.name, p)
 
-    const ordered = []
-    for (const key of CHAR_ORDER) {
-      if (playerMap.has(key)) ordered.push(playerMap.get(key))
-    }
-    for (const p of players) {
-      if (!CHAR_ORDER.includes(p.name)) ordered.push(p)
-    }
-
-    for (const p of ordered) {
-      const cd = charData(p.name)
-      const hasVoted = playerHasVoted(p)
-      const isSpeaking = p.attributes?.IsSpeaking === true
-
-      const el = document.createElement('div')
-      el.className = 'sv-char'
-      if (isSpeaking) el.classList.add('speaking')
-      if (hasVoted)   el.classList.add('voted')
-
-      if (cd.portrait) {
-        const img = document.createElement('img')
-        img.className = 'sv-portrait'
-        img.src = cd.portrait
-        img.alt = cd.name
-        el.appendChild(img)
-      } else {
-        const sil = document.createElement('div')
-        sil.className = 'sv-sil'
-        sil.style.backgroundColor = cd.color
-        el.appendChild(sil)
-      }
-
-      const badge = document.createElement('div')
-      badge.className = 'sv-badge'
-      badge.textContent = '\u2713'
-      el.appendChild(badge)
-
-      const nameTag = document.createElement('div')
-      nameTag.className = 'sv-name'
-      nameTag.textContent = cd.name
-      el.appendChild(nameTag)
-
+    toShow.forEach((entry, i) => {
+      const p = playerMap.get(entry.name)
+      const hasVoted = p ? playerHasVoted(p) : false
+      const el = buildCharacterEl(entry.name, entry.isSpeaking, hasVoted)
+      positionCharacter(el, i, toShow.length)
       $chars.appendChild(el)
-    }
+      requestAnimationFrame(() => el.classList.add('visible'))
+    })
   }
 
   // ── Vote HUD ──
@@ -354,6 +522,15 @@ export function createRenderer(ctx) {
       $title.classList.add('hidden')
     }
 
+    hasSpeechStarted = true
+
+    // Track speaker transitions
+    if (speaker !== currentSpeaker) {
+      previousSpeaker = currentSpeaker
+      currentSpeaker = speaker
+      renderCharacters()
+    }
+
     const cd = charData(speaker)
     $speaker.textContent = cd.name
     $speaker.style.color = cd.color
@@ -373,30 +550,14 @@ export function createRenderer(ctx) {
     }, 25)
   }
 
-  function appendLog(speaker, text) {
-    const cd = charData(speaker)
-    const entry = document.createElement('div')
-    entry.className = 'sv-log-entry'
-
-    const nameSpan = document.createElement('span')
-    nameSpan.className = 'sv-log-name'
-    nameSpan.style.color = cd.color
-    nameSpan.textContent = cd.name + ': '
-    entry.appendChild(nameSpan)
-
-    const textNode = document.createTextNode(text.length > 120 ? text.slice(0, 117) + '...' : text)
-    entry.appendChild(textNode)
-
-    $log.appendChild(entry)
-    $log.scrollTop = $log.scrollHeight
-  }
+  // ── Preload all assets on init ──
+  preloadAssets()
 
   // ── Renderer lifecycle ──
   return {
     onState(state) {
       // Speech events arrive as {type: "speech", speaker, text, seq}
       if (state.type === 'speech') {
-        appendLog(state.speaker, state.text)
         showSpeech(state.speaker, state.text)
         return
       }

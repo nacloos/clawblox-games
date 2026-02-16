@@ -6,8 +6,7 @@
 |-------|------|-------------|
 | Vote | `{"target": "player_name"}` | Cast your vote to eliminate a player |
 | UseIdol | `{"target": "player_name"}` | Play a hidden immunity idol to protect someone |
-| ClaimSpeaking | _(none)_ | Claim the speaking lock (only one agent speaks at a time) |
-| ReleaseSpeaking | _(none)_ | Release the speaking lock after finishing speech |
+| PlaySpeech | `{"stream_id": "id"}` | Claim speaking turn and start tracking audio playback; turn releases on frontend `audio_done` |
 
 ## Observation
 

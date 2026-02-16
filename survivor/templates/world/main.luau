@@ -107,6 +107,47 @@ end
 -- INPUT HANDLING
 --------------------------------------------------------------------------------
 
+local activeSpeechStreams = {}  -- stream_id -> playerName
+
+local function clearSpeakerByName(name)
+    if not name or name == "" then
+        return
+    end
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Name == name then
+            p:SetAttribute("IsSpeaking", false)
+            break
+        end
+    end
+    if gameState:GetAttribute("current_speaker") == name then
+        gameState:SetAttribute("current_speaker", "")
+        gameState:SetAttribute("speaker_claimed_at", 0)
+    end
+end
+
+local function hasActiveStreamForPlayer(name)
+    for _, streamSpeaker in pairs(activeSpeechStreams) do
+        if streamSpeaker == name then
+            return true
+        end
+    end
+    return false
+end
+
+local function releaseStream(streamId)
+    local speakerName = activeSpeechStreams[streamId]
+    if not speakerName then
+        return false
+    end
+    activeSpeechStreams[streamId] = nil
+    -- If this speaker still has another active stream (e.g. multiple <speak> tags),
+    -- keep the speaking lock until the final stream finishes.
+    if not hasActiveStreamForPlayer(speakerName) then
+        clearSpeakerByName(speakerName)
+    end
+    return true
+end
+
 AgentInputService.InputReceived:Connect(function(player, inputType, inputData)
     if inputType == "Vote" and inputData and inputData.target then
         if player.Name == "host" then return end
@@ -120,19 +161,39 @@ AgentInputService.InputReceived:Connect(function(player, inputType, inputData)
         end
     elseif inputType == "UseIdol" and inputData and inputData.target then
         idolPlays[player.Name] = inputData.target
-    elseif inputType == "ClaimSpeaking" then
+    elseif inputType == "PlaySpeech" then
+        if not inputData or not inputData.stream_id then
+            warn("[PlaySpeech] Missing stream_id from " .. player.Name)
+            return
+        end
+
+        -- Reject if someone else is speaking
         local speaker = gameState:GetAttribute("current_speaker")
-        if speaker == "" or speaker == nil then
-            gameState:SetAttribute("current_speaker", player.Name)
-            gameState:SetAttribute("speaker_claimed_at", tick())
-            player:SetAttribute("IsSpeaking", true)
+        if speaker ~= "" and speaker ~= nil and speaker ~= player.Name then
+            warn("[PlaySpeech] Rejected: " .. player.Name .. " tried to speak but " .. speaker .. " is speaking")
+            return
         end
-    elseif inputType == "ReleaseSpeaking" then
-        if gameState:GetAttribute("current_speaker") == player.Name then
-            gameState:SetAttribute("current_speaker", "")
-            gameState:SetAttribute("speaker_claimed_at", 0)
-            player:SetAttribute("IsSpeaking", false)
+
+        -- Claim the turn
+        gameState:SetAttribute("current_speaker", player.Name)
+        gameState:SetAttribute("speaker_claimed_at", tick())
+        player:SetAttribute("IsSpeaking", true)
+
+        activeSpeechStreams[inputData.stream_id] = player.Name
+    elseif inputType == "SpeechFinished" or inputType == "AudioEnded" then
+        if not inputData or not inputData.stream_id then
+            warn("[" .. inputType .. "] Missing stream_id")
+            return
         end
+        if not activeSpeechStreams[inputData.stream_id] then
+            warn("[" .. inputType .. "] No active stream for stream_id: " .. tostring(inputData.stream_id))
+            return
+        end
+        -- Optional reason can help with debugging turn ownership behavior.
+        if inputData.reason and inputData.reason ~= "playback_done" then
+            warn("[" .. inputType .. "] stream_id=" .. tostring(inputData.stream_id) .. " reason=" .. tostring(inputData.reason))
+        end
+        releaseStream(inputData.stream_id)
     end
 end)
 
@@ -146,14 +207,15 @@ RunService.Heartbeat:Connect(function(dt)
     if speaker and speaker ~= "" then
         local claimedAt = gameState:GetAttribute("speaker_claimed_at")
         if claimedAt > 0 and tick() - claimedAt > 15 then
-            for _, p in ipairs(Players:GetPlayers()) do
-                if p.Name == speaker then
-                    p:SetAttribute("IsSpeaking", false)
-                    break
+            warn("[Heartbeat] Force-releasing speaking lock for " .. speaker .. " after 15s timeout")
+            -- Clean up any active streams for this speaker
+            for streamId, streamSpeaker in pairs(activeSpeechStreams) do
+                if streamSpeaker == speaker then
+                    releaseStream(streamId)
                 end
             end
-            gameState:SetAttribute("current_speaker", "")
-            gameState:SetAttribute("speaker_claimed_at", 0)
+            -- Defensive clear in case stream map and speaker lock drift out of sync.
+            clearSpeakerByName(speaker)
         end
     end
 end)

@@ -144,6 +144,19 @@ function extractActions(text) {
 const _TTS_PUNCT = [".", "!", "?", "\n", ":", ";"];
 const _TTS_MIN_SENTENCE_CHARS = 24;
 const _TTS_MAX_BUFFER_CHARS = 80;
+const AUDIO_SAMPLE_RATE_HZ = 24000;
+const AUDIO_CHANNELS = 1;
+const AUDIO_BYTES_PER_SAMPLE = 2;
+
+function base64DecodedLen(data) {
+	if (!data || typeof data !== "string") return 0;
+	const len = data.length;
+	if (len === 0 || len % 4 !== 0) return 0;
+	let pad = 0;
+	if (data.endsWith("==")) pad = 2;
+	else if (data.endsWith("=")) pad = 1;
+	return (len / 4) * 3 - pad;
+}
 
 function popTtsEmitText(buffer) {
 	let lastBoundary = -1;
@@ -246,7 +259,7 @@ class ElevenLabsMultiContextPlayer {
 			if (ctxState && !ctxState.doneSent) {
 				ctxState.chunkCount++;
 				ctxState.lastChunkTime = Date.now();
-				ctxState.totalAudioLen += data.audio.length;
+				ctxState.totalAudioBytes += base64DecodedLen(data.audio);
 				if (!ctxState.playbackStartTime) ctxState.playbackStartTime = Date.now();
 				debugLog(`WS chunk #${ctxState.chunkCount} ctx=${contextId} audioLen=${data.audio.length}`);
 				void this._sendChunk(contextId, ctxState.chunkCount - 1, data.audio, false);
@@ -308,7 +321,7 @@ class ElevenLabsMultiContextPlayer {
 
 	// --- Incremental streaming API (matches audio.py pattern) ---
 
-	/** Pre-set the context ID for the next streaming context (used to correlate with PlaySpeech). */
+	/** Pre-set the context ID for the next streaming context (used to correlate with SpeechBus Claim). */
 	setNextContextId(id) {
 		this._pendingContextId = id;
 	}
@@ -323,7 +336,7 @@ class ElevenLabsMultiContextPlayer {
 			this._streamingCtx = contextId;
 			this._streamingBuffer = "";
 			this.currentContextId = contextId;
-			const ctxState = { chunkCount: 0, lastChunkTime: 0, doneSent: false, resolve: null, totalAudioLen: 0, playbackStartTime: 0 };
+			const ctxState = { chunkCount: 0, lastChunkTime: 0, doneSent: false, resolve: null, totalAudioBytes: 0, playbackStartTime: 0 };
 			this.contextStates.set(contextId, ctxState);
 			debugLog(`sendTextChunk: new ctx=${contextId}`);
 			// Send voice_settings on the first message
@@ -347,7 +360,15 @@ class ElevenLabsMultiContextPlayer {
 	/** Flush the current streaming context: send remaining text + flush signal, wait for audio to finish. */
 	async flushStream({ speechText } = {}) {
 		const contextId = this._streamingCtx;
-		if (!contextId) return;
+		if (!contextId) {
+			return {
+				totalAudioBytes: 0,
+				sampleRateHz: AUDIO_SAMPLE_RATE_HZ,
+				channels: AUDIO_CHANNELS,
+				bytesPerSample: AUDIO_BYTES_PER_SAMPLE,
+				playbackSpeed: this.speed,
+			};
+		}
 		this._streamingCtx = null;
 		const ctxState = this.contextStates.get(contextId);
 
@@ -361,7 +382,15 @@ class ElevenLabsMultiContextPlayer {
 		this._wsSend({ context_id: contextId, flush: true });
 		debugLog(`flushStream: flushed ctx=${contextId}`);
 
-		if (!ctxState) return;
+		if (!ctxState) {
+			return {
+				totalAudioBytes: 0,
+				sampleRateHz: AUDIO_SAMPLE_RATE_HZ,
+				channels: AUDIO_CHANNELS,
+				bytesPerSample: AUDIO_BYTES_PER_SAMPLE,
+				playbackSpeed: this.speed,
+			};
+		}
 		const done = new Promise((resolve) => { ctxState.resolve = resolve; });
 
 		// Silence detector: 1.5s of no new chunks after first chunk = done
@@ -382,7 +411,15 @@ class ElevenLabsMultiContextPlayer {
 			this._completeContext(contextId, speechText);
 		}
 
+		const meta = {
+			totalAudioBytes: ctxState.totalAudioBytes || 0,
+			sampleRateHz: AUDIO_SAMPLE_RATE_HZ,
+			channels: AUDIO_CHANNELS,
+			bytesPerSample: AUDIO_BYTES_PER_SAMPLE,
+			playbackSpeed: this.speed,
+		};
 		this.contextStates.delete(contextId);
+		return meta;
 	}
 
 	// --- Legacy batch API (kept for enqueue compatibility) ---
@@ -411,7 +448,16 @@ class ElevenLabsMultiContextPlayer {
 
 	async _sendChunk(streamId, seq, data, done, speechText) {
 		try {
-			const body = { stream_id: streamId, seq, data, done };
+			const body = {
+				stream_id: streamId,
+				seq,
+				data,
+				done,
+				sample_rate_hz: AUDIO_SAMPLE_RATE_HZ,
+				channels: AUDIO_CHANNELS,
+				bytes_per_sample: AUDIO_BYTES_PER_SAMPLE,
+				playback_speed: this.speed,
+			};
 			if (done && speechText) body.speech_text = speechText;
 			await fetch(this.audioUrl, {
 				method: "POST",
@@ -722,6 +768,7 @@ actionAgent.setSteeringMode("all");
 
 const disableActionAgent = true;
 const disableSpeechAgent = cliFlags.has("--no-speech");
+const disableAudio = cliFlags.has("--no-audio");
 
 const state = {
 	speechBusy: false,
@@ -746,8 +793,8 @@ const ACTION_IDLE_MS = 2000;
 let speechStreamText = "";
 let ttsInsideSpeak = false; // true while accumulating text inside <speak>/<s> tag
 let ttsSpeakAccum = ""; // full text of current speak segment (for speech channel + logging)
-let ttsSpeakStreamId = null; // stream_id for PlaySpeech claim of current speak segment
-let ttsCanStream = false; // true only after PlaySpeech claim confirmed
+let ttsSpeakStreamId = null; // stream_id for SpeechBus claim of current speak segment
+let ttsCanStream = false; // true only after SpeechBus claim confirmed
 let ttsPendingText = ""; // buffered speak text while claim is pending
 let ttsClaimPromise = null; // promise resolving to claim result for current stream
 
@@ -772,7 +819,7 @@ const elevenLabsVoiceId =
 	agentConfig.voice_id || process.env.ELEVENLABS_VOICE_ID || "";
 const elevenLabsModelId = process.env.ELEVENLABS_MODEL_ID || "eleven_flash_v2_5";
 const audioPlayer =
-	elevenLabsApiKey && elevenLabsVoiceId
+	!disableAudio && elevenLabsApiKey && elevenLabsVoiceId
 		? new ElevenLabsMultiContextPlayer({
 				apiKey: elevenLabsApiKey,
 				voiceId: elevenLabsVoiceId,
@@ -928,8 +975,15 @@ async function sendWorldInput(inputType, data = {}) {
 	return await res.json();
 }
 
-async function sendPlaySpeech(streamId) {
-	const obs = await sendWorldInput("PlaySpeech", { stream_id: streamId });
+async function sendSpeechBus(op, payload = {}) {
+	return await sendWorldInput("RemoteEvent", {
+		name: "SpeechBus",
+		args: [{ op, ...payload }],
+	});
+}
+
+async function sendSpeechClaim(streamId) {
+	const obs = await sendSpeechBus("Claim", { stream_id: streamId });
 	const isClaimedBySelf = (o) => {
 		if (!o) return false;
 		if (o?.player?.attributes?.IsSpeaking === true) return true;
@@ -952,9 +1006,38 @@ async function sendPlaySpeech(streamId) {
 		} catch {}
 	}
 	if (!claimed) {
-		debugLog(`sendPlaySpeech: claim rejected for stream ${streamId}`);
+		debugLog(`sendSpeechClaim: claim rejected for stream ${streamId}`);
 	}
 	return claimed;
+}
+
+async function sendSpeechClaimWithRetry(streamId, { maxWaitMs = 6000, retryDelayMs = 180 } = {}) {
+	const deadline = Date.now() + maxWaitMs;
+	while (Date.now() < deadline) {
+		try {
+			const claimed = await sendSpeechClaim(streamId);
+			if (claimed) return true;
+		} catch {}
+		await sleep(retryDelayMs);
+	}
+	debugLog(`sendSpeechClaimWithRetry: timed out for stream ${streamId}`);
+	return false;
+}
+
+async function sendSpeechFinalize(streamId, speechText, playbackMeta = {}) {
+	try {
+		await sendSpeechBus("Finalize", {
+			stream_id: streamId,
+			speech_text: speechText || "",
+			total_audio_bytes: Number(playbackMeta.totalAudioBytes || 0),
+			sample_rate_hz: Number(playbackMeta.sampleRateHz || AUDIO_SAMPLE_RATE_HZ),
+			channels: Number(playbackMeta.channels || AUDIO_CHANNELS),
+			bytes_per_sample: Number(playbackMeta.bytesPerSample || AUDIO_BYTES_PER_SAMPLE),
+			playback_speed: Number(playbackMeta.playbackSpeed || 1.0),
+		});
+	} catch (err) {
+		debugLog(`sendSpeechFinalize error for ${streamId}: ${err instanceof Error ? err.message : String(err)}`);
+	}
 }
 
 async function executeActions(actions) {
@@ -1346,7 +1429,7 @@ speechAgent.subscribe(async (event) => {
 						const streamId = `ctx_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
 						ttsSpeakStreamId = streamId;
 						audioPlayer?.setNextContextId(streamId);
-						ttsClaimPromise = sendPlaySpeech(streamId)
+						ttsClaimPromise = sendSpeechClaimWithRetry(streamId)
 							.then((claimed) => {
 								// Ignore stale claim results from old streams.
 								if (ttsSpeakStreamId !== streamId) return false;
@@ -1365,7 +1448,7 @@ speechAgent.subscribe(async (event) => {
 							})
 							.catch((err) => {
 								if (ttsSpeakStreamId === streamId) {
-									debugLog(`sendPlaySpeech error for ${streamId}: ${err instanceof Error ? err.message : String(err)}`);
+									debugLog(`sendSpeechClaim error for ${streamId}: ${err instanceof Error ? err.message : String(err)}`);
 									ttsCanStream = false;
 									ttsPendingText = "";
 									audioPlayer?.interrupt();
@@ -1438,15 +1521,26 @@ speechAgent.subscribe(async (event) => {
 
 				if (claimed) {
 					const spokenText = ttsSpeakAccum;
+					let playbackMeta = {
+						totalAudioBytes: 0,
+						sampleRateHz: AUDIO_SAMPLE_RATE_HZ,
+						channels: AUDIO_CHANNELS,
+						bytesPerSample: AUDIO_BYTES_PER_SAMPLE,
+						playbackSpeed: 1.0,
+					};
+					if (audioPlayer) {
+						if (spokenText.trim()) {
+							playbackMeta = await audioPlayer.flushStream({ speechText: spokenText }) || playbackMeta;
+						} else {
+							playbackMeta = await audioPlayer.flushStream() || playbackMeta;
+						}
+					}
 					if (spokenText.trim()) {
 						markConversationActivity("self_spoke");
 						addSpeechLine(`[speak] ${spokenText.slice(0, 80)}`);
 						if (claimed) maybePostSpeechPreview(spokenText, true);
-						// Publish speech text with done chunk; server emits speech event on playback completion.
-						await audioPlayer?.flushStream({ speechText: spokenText });
-					} else {
-						await audioPlayer?.flushStream();
 					}
+					await sendSpeechFinalize(streamId, spokenText, playbackMeta);
 				} else {
 					debugLog(`message_end: skipping TTS flush for unclaimed stream ${streamId}`);
 				}
@@ -1551,6 +1645,9 @@ addSpeechLine("Non-interactive mode enabled (plain logs, no TUI).");
 // addSpeechLine(`[stall] config threshold=${STALL_CUE_MS}ms cooldown=${STALL_CUE_COOLDOWN_MS}ms startup_grace=${STALL_CUE_STARTUP_GRACE_MS}ms`);
 if (disableSpeechAgent) {
 	addSpeechLine("Speech agent disabled (--no-speech).");
+}
+if (disableAudio) {
+	addSpeechLine("Audio generation/playback disabled (--no-audio).");
 }
 if (disableActionAgent) {
 	addActionLine("Action agent disabled (--no-action).");

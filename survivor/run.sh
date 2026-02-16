@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # (Re)start the clawblox server and launch agents for Tribal Council.
-# Usage: ./run.sh
+# Usage: ./run.sh [--no-audio]
 
 set -euo pipefail
 
@@ -15,6 +15,25 @@ mkdir -p "$LOGS"
 
 declare -a PIDS=()
 SHUTTING_DOWN=0
+declare -a AGENT_EXTRA_ARGS=()
+
+for arg in "$@"; do
+  case "$arg" in
+    --no-audio)
+      AGENT_EXTRA_ARGS+=("--no-audio")
+      ;;
+    -h|--help)
+      echo "Usage: ./run.sh [--no-audio]"
+      echo "  --no-audio   Disable audio generation/playback in agent2"
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $arg"
+      echo "Usage: ./run.sh [--no-audio]"
+      exit 1
+      ;;
+  esac
+done
 
 is_alive() {
   local pid="$1"
@@ -125,7 +144,7 @@ fi
 for name in "${AGENTS[@]}"; do
   : > "$LOGS/$name.log"
   echo "Launching $name... (log: logs/$name.log)"
-  node "$AGENT" --name "$name" --dir "$DIR" --no-action >> "$LOGS/$name.log" 2>&1 &
+  node "$AGENT" --name "$name" --dir "$DIR" --no-action "${AGENT_EXTRA_ARGS[@]}" >> "$LOGS/$name.log" 2>&1 &
   PIDS+=("$!")
 done
 sleep 3

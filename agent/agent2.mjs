@@ -268,10 +268,19 @@ class ElevenLabsMultiContextPlayer {
 			}
 		}
 
-			if (data.isFinal || data.is_final) {
-				if (ctxState) ctxState.receivedFinal = true;
-				debugLog(`WS is_final ctx=${contextId} chunks=${ctxState?.chunkCount ?? "?"}`);
-				this._completeContext(contextId);
+		if (data.isFinal || data.is_final) {
+			let finalContextId = contextId;
+			if (!finalContextId) {
+				if (this.currentContextId && this.contextStates.has(this.currentContextId)) {
+					finalContextId = this.currentContextId;
+				} else if (this.contextStates.size === 1) {
+					for (const onlyId of this.contextStates.keys()) {
+						finalContextId = onlyId;
+					}
+				}
+			}
+			debugLog(`WS is_final observed ctx=${finalContextId || "(none)"}`);
+			if (finalContextId) this._completeContext(finalContextId);
 		}
 
 		if (data.error || data.message) {
@@ -286,9 +295,13 @@ class ElevenLabsMultiContextPlayer {
 	_completeContext(contextId, speechText) {
 		const ctxState = this.contextStates.get(contextId);
 		if (!ctxState || ctxState.doneSent) return;
+		const finalSpeechText = typeof speechText === "string"
+			? speechText
+			: (typeof ctxState.finalSpeechText === "string" ? ctxState.finalSpeechText : "");
 		ctxState.doneSent = true;
-		void this._sendChunk(contextId, ctxState.chunkCount, "", true, speechText);
+		void this._sendChunk(contextId, ctxState.chunkCount, "", true, finalSpeechText);
 		if (ctxState.resolve) ctxState.resolve();
+		if (this.currentContextId === contextId) this.currentContextId = null;
 	}
 
 	_startKeepAlive() {
@@ -345,6 +358,7 @@ class ElevenLabsMultiContextPlayer {
 					totalAudioBytes: 0,
 					playbackStartTime: 0,
 					receivedFinal: false,
+					finalSpeechText: "",
 				};
 			this.contextStates.set(contextId, ctxState);
 			debugLog(`sendTextChunk: new ctx=${contextId}`);
@@ -400,8 +414,15 @@ class ElevenLabsMultiContextPlayer {
 				playbackSpeed: this.speed,
 			};
 		}
-			const done = new Promise((resolve) => { ctxState.resolve = resolve; });
-			await done;
+
+		// ElevenLabs recommends explicit context lifecycle control.
+		// Close context at end of turn, but only complete when upstream signals is_final.
+		ctxState.finalSpeechText = typeof speechText === "string" ? speechText : "";
+		this._wsSend({ context_id: contextId, close_context: true });
+		debugLog(`flushStream: close_context ctx=${contextId}`);
+		const done = new Promise((resolve) => { ctxState.resolve = resolve; });
+		await done;
+		debugLog(`flushStream: completed ctx=${contextId}`);
 
 		const meta = {
 			totalAudioBytes: ctxState.totalAudioBytes || 0,
@@ -494,7 +515,9 @@ function loadCodexAccessToken(scriptDir) {
 			const auth = JSON.parse(readFileSync(p, "utf8"));
 			const creds = auth?.["openai-codex"];
 			if (creds && typeof creds.access === "string" && creds.access.length > 0) return creds.access;
-		} catch {}
+		} catch (err) {
+			debugLog(`loadCodexAccessToken parse error at ${p}: ${err instanceof Error ? err.message : String(err)}`);
+		}
 	}
 	return undefined;
 }
@@ -1005,7 +1028,9 @@ async function sendSpeechClaim(streamId) {
 			await sleep(80);
 			const retryObs = await fetchObserve();
 			claim = getSpeechLeaseFromObservation(retryObs, streamId);
-		} catch {}
+		} catch (err) {
+			debugLog(`sendSpeechClaim retry observe error for ${streamId}: ${err instanceof Error ? err.message : String(err)}`);
+		}
 	}
 	if (!claim.claimed) {
 		debugLog(`sendSpeechClaim: claim rejected for stream ${streamId}`);
@@ -1018,7 +1043,9 @@ async function sendSpeechClaimWithRetry(streamId, { retryDelayMs = SPEECH_CLAIM_
 		try {
 			const claim = await sendSpeechClaim(streamId);
 			if (claim.claimed && claim.leaseId) return claim.leaseId;
-		} catch {}
+		} catch (err) {
+			debugLog(`sendSpeechClaimWithRetry error for ${streamId}: ${err instanceof Error ? err.message : String(err)}`);
+		}
 		await sleep(retryDelayMs);
 	}
 	debugLog(`sendSpeechClaimWithRetry: aborted due to shutdown for stream ${streamId}`);
@@ -1059,6 +1086,7 @@ async function sendSpeechFinalize(streamId, leaseId, speechText, playbackMeta = 
 			bytes_per_sample: Number(playbackMeta.bytesPerSample || AUDIO_BYTES_PER_SAMPLE),
 			playback_speed: Number(playbackMeta.playbackSpeed || 1.0),
 		});
+		debugLog(`sendSpeechFinalize: stream=${streamId} lease=${leaseId || "(none)"} bytes=${Number(playbackMeta.totalAudioBytes || 0)}`);
 	} catch (err) {
 		debugLog(`sendSpeechFinalize error for ${streamId}: ${err instanceof Error ? err.message : String(err)}`);
 	}
@@ -1169,6 +1197,8 @@ let speechWs = null;
 let speechWsActive = false;
 let speechWsReconnectTimer = null;
 let speechLastSeq = 0;
+const playbackDoneWaiters = new Map(); // stream_id -> { resolve }
+const completedPlaybackStreams = new Map(); // stream_id -> playback_done payload
 const pendingSpeechEvents = [];
 const UI_PREVIEW_PREFIX = "[[ui_preview]] ";
 let previewLastSentAt = 0;
@@ -1265,12 +1295,8 @@ function handleSpeechEvent(ev) {
 		return;
 	}
 	markConversationActivity(`heard:${ev.speaker}`);
-	const currentSpeaker = getCurrentSpeakerFromObservation(lastObservation);
-	if (currentSpeaker && currentSpeaker === ev.speaker) {
-		pendingSpeechEvents.push(ev);
-		debugLog(`defer heard speech seq=${ev.seq} speaker=${ev.speaker} until speaker lock clears`);
-		return;
-	}
+	// Process heard speech immediately. Deferring on speaker lock caused stalls when
+	// observation-driven flush did not run, so replies could be blocked indefinitely.
 	addSpeechLine(`[heard] ${ev.speaker}: ${ev.text}`);
 	speechAgent.steer({
 		role: "user",
@@ -1278,6 +1304,30 @@ function handleSpeechEvent(ev) {
 		timestamp: Date.now(),
 	});
 	if (!isSpeechPipelineBusy()) void runSpeechContinue(`heard:${ev.speaker}`);
+}
+
+function resolveSelfPlaybackDone(ev) {
+	const streamId = String(ev?.stream_id || "").trim();
+	if (!streamId) return;
+	completedPlaybackStreams.set(streamId, ev || {});
+	const waiter = playbackDoneWaiters.get(streamId);
+	if (waiter) {
+		playbackDoneWaiters.delete(streamId);
+		waiter.resolve(ev || {});
+	}
+}
+
+async function waitForSelfPlaybackDone(streamId) {
+	const id = String(streamId || "").trim();
+	if (!id) return null;
+	const completed = completedPlaybackStreams.get(id);
+	if (completed) {
+		completedPlaybackStreams.delete(id);
+		return completed;
+	}
+	return await new Promise((resolve) => {
+		playbackDoneWaiters.set(id, { resolve });
+	});
 }
 
 function connectSpeechWs() {
@@ -1296,13 +1346,14 @@ function connectSpeechWs() {
 		try {
 			const text = typeof raw === "string" ? raw : Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw);
 			const parsed = JSON.parse(text);
-			if (parsed?.type === "speech") {
-				handleSpeechEvent(parsed);
-			} else if (parsed?.type === "playback_done") {
-				if (parsed?.speaker === worldAgentName) {
-					markConversationActivity(`self_playback_done:${parsed?.stream_id || "unknown"}`);
+				if (parsed?.type === "speech") {
+					handleSpeechEvent(parsed);
+				} else if (parsed?.type === "playback_done") {
+					if (parsed?.speaker === worldAgentName) {
+						markConversationActivity(`self_playback_done:${parsed?.stream_id || "unknown"}`);
+						resolveSelfPlaybackDone(parsed);
+					}
 				}
-			}
 		} catch {
 			// Ignore non-JSON / non-speech messages (state snapshots, binary, etc.).
 		}
@@ -1333,7 +1384,9 @@ function stopSpeechWsLoop() {
 	if (speechWs) {
 		try {
 			speechWs.close();
-		} catch {}
+		} catch (err) {
+			debugLog(`[speech-ws] close error: ${err instanceof Error ? err.message : String(err)}`);
+		}
 		speechWs = null;
 	}
 }
@@ -1572,8 +1625,6 @@ speechAgent.subscribe(async (event) => {
 				}
 
 					if (claimed) {
-						// After text streaming is complete, lease extension stops; server lease expiry handles stalled finalization.
-						stopSpeechHeartbeat();
 						const spokenText = ttsSpeakAccum;
 						let playbackMeta = {
 							totalAudioBytes: 0,
@@ -1594,10 +1645,15 @@ speechAgent.subscribe(async (event) => {
 							addSpeechLine(`[speak] ${spokenText.slice(0, 80)}`);
 							if (claimed) maybePostSpeechPreview(spokenText, true);
 						}
+						if (audioPlayer) {
+							await waitForSelfPlaybackDone(streamId);
+						}
 						await sendSpeechFinalize(streamId, leaseId, spokenText, playbackMeta);
+						stopSpeechHeartbeat();
 					} else {
 						await sendSpeechCancel(streamId, leaseId || null);
 						debugLog(`message_end: skipping TTS flush for unclaimed stream ${streamId}`);
+						stopSpeechHeartbeat();
 					}
 				}
 			speechStreamText = "";
@@ -1673,17 +1729,29 @@ async function shutdown(reason = "signal") {
 	}
 	try {
 		audioPlayer?.interrupt();
-	} catch {}
+	} catch (err) {
+		debugLog(`audio interrupt error during shutdown: ${err instanceof Error ? err.message : String(err)}`);
+	}
 	try {
 		audioPlayer?.close();
-	} catch {}
+	} catch (err) {
+		debugLog(`audio close error during shutdown: ${err instanceof Error ? err.message : String(err)}`);
+	}
 
 	if (state.speechBusy) {
-		try { speechAgent.abort(); } catch {}
+		try {
+			speechAgent.abort();
+		} catch (err) {
+			debugLog(`speechAgent.abort error: ${err instanceof Error ? err.message : String(err)}`);
+		}
 		state.speechBusy = false;
 	}
 	if (state.actionBusy) {
-		try { actionAgent.abort(); } catch {}
+		try {
+			actionAgent.abort();
+		} catch (err) {
+			debugLog(`actionAgent.abort error: ${err instanceof Error ? err.message : String(err)}`);
+		}
 		state.actionBusy = false;
 	}
 

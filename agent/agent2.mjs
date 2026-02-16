@@ -609,12 +609,8 @@ function loadContextFile(name) {
 
 const worldBaseUrl = process.env.WORLD_BASE_URL || "http://localhost:8080";
 const worldAgentName = agentName || `${scriptName}-${process.pid}`;
-const observeIntervalMs = Number(process.env.OBSERVE_MS || "2000");
 let worldSession = "";
 let worldAgentId = "";
-let observeLoopEnabled = true;
-let observeTimer = null;
-let observeTick = 0;
 let lastObservation = null;
 
 async function joinWorldOrThrow() {
@@ -881,14 +877,21 @@ function persistActionConversation() {
 	writeFileSync(actionConversationPath, JSON.stringify(actionAgent.state.messages, null, 2));
 }
 
-function getCurrentSpeakerFromObservation(observation) {
+function getGameStateAttributesFromObservation(observation) {
 	const entities = Array.isArray(observation?.world?.entities) ? observation.world.entities : [];
 	for (const entity of entities) {
 		if (entity?.name !== "GameState") continue;
-		const speaker = String(entity?.attributes?.current_speaker || "").trim();
-		return speaker;
+		const attrs = entity?.attributes;
+		if (attrs && typeof attrs === "object") return attrs;
+		return {};
 	}
-	return "";
+	return null;
+}
+
+function getCurrentSpeakerFromObservation(observation) {
+	const attrs = getGameStateAttributesFromObservation(observation);
+	if (!attrs) return "";
+	return String(attrs.current_speaker || "").trim();
 }
 
 function isSpeechTurnBlocked() {
@@ -1183,47 +1186,6 @@ async function executeActions(actions) {
 	}
 }
 
-function injectObserveForSpeech(observation) {
-	observeTick += 1;
-	const toolCallId = `bridge_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-	const action = {
-		type: "Observe",
-		data: {
-			tick: observation?.tick ?? observeTick,
-		},
-	};
-	speechAgent.steer({
-		role: "assistant",
-		content: [{ type: "toolCall", id: toolCallId, name: "act_in_world", arguments: { action } }],
-		api: model.api,
-		provider: model.provider,
-		model: model.id,
-		usage: {
-			input: 0,
-			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 0,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		},
-		stopReason: "toolUse",
-		timestamp: Date.now(),
-	});
-
-	const diff = diffObservation(lastObservation, observation);
-	lastObservation = observation;
-
-	speechAgent.steer({
-		role: "toolResult",
-		toolCallId,
-		toolName: "act_in_world",
-		content: [{ type: "text", text: JSON.stringify({ ok: true, observation: diff }) }],
-		details: {},
-		isError: false,
-		timestamp: Date.now(),
-	});
-}
-
 function injectActionForSpeech(activities) {
 	for (const activity of activities) {
 		const toolCallId = `action_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -1258,17 +1220,15 @@ let speechLastSeq = 0;
 const playbackDoneWaiters = new Map(); // stream_id -> { resolve }
 const completedPlaybackStreams = new Map(); // stream_id -> playback_done payload
 const pendingSpeechEvents = [];
-const STALL_CUE_MS = Number(process.env.STALL_CUE_MS || "10000");
-const STALL_CUE_COOLDOWN_MS = Number(process.env.STALL_CUE_COOLDOWN_MS || "4000");
-const STALL_CUE_STARTUP_GRACE_MS = Number(process.env.STALL_CUE_STARTUP_GRACE_MS || "1500");
 const STALL_CUE_TEXT = process.env.STALL_CUE_TEXT || "[scene cue]: Everyone stays silent for a moment. The pause turns awkward.";
+const SERVER_SILENCE_REPEAT_MS = Number(process.env.SERVER_SILENCE_REPEAT_MS || "2000");
 const SPEECH_CLAIM_RETRY_DELAY_MS = Number(process.env.SPEECH_CLAIM_RETRY_DELAY_MS || "180");
 const SPEECH_PROGRESS_MIN_INTERVAL_MS = Number(process.env.SPEECH_PROGRESS_MIN_INTERVAL_MS || "120");
 let lastConversationActivityAt = Date.now();
-let lastStallCueAt = 0;
+let lastServerSilenceEpochHandled = 0;
+let lastServerSilenceCueAt = 0;
 let stallCueTimer = null;
 let stallCueObserveInFlight = false;
-const stallCueStartedAt = Date.now();
 let lastStallSkipReason = "";
 let lastStallSkipLogAt = 0;
 
@@ -1424,27 +1384,6 @@ function stopSpeechWsLoop() {
 	}
 }
 
-function stopObserveLoop() {
-	if (observeTimer) clearInterval(observeTimer);
-	observeTimer = null;
-}
-
-function startObserveLoop() {
-	stopObserveLoop();
-	observeLoopEnabled = true;
-	observeTimer = setInterval(async () => {
-		if (!observeLoopEnabled || isClosing) return;
-		try {
-			const obs = await fetchObserve();
-			if (!obs) return;
-			injectObserveForSpeech(obs);
-			flushDeferredSpeechEvents();
-				if (!isSpeechPipelineBusy() && speechAgent.state.messages.length > 0) void runSpeechContinue("observeLoop");
-		} catch (error) {
-			addSpeechLine(`[observe] error: ${error instanceof Error ? error.message : String(error)}`);
-		}
-	}, Math.max(250, observeIntervalMs));
-}
 
 function startStallCueLoop() {
 	stopStallCueLoop();
@@ -1455,22 +1394,6 @@ function startStallCueLoop() {
 		}
 		if (isSpeechPipelineBusy()) {
 			logStallSkip("speech_busy");
-			return;
-		}
-		const nowMs = Date.now();
-		const startupElapsedMs = nowMs - stallCueStartedAt;
-		const idleMs = nowMs - lastConversationActivityAt;
-		const sinceLastCueMs = nowMs - lastStallCueAt;
-		if (startupElapsedMs < STALL_CUE_STARTUP_GRACE_MS) {
-			logStallSkip(`startup_grace remaining=${STALL_CUE_STARTUP_GRACE_MS - startupElapsedMs}ms`);
-			return;
-		}
-		if (idleMs < STALL_CUE_MS) {
-			logStallSkip(`idle_below_threshold idle=${idleMs}ms threshold=${STALL_CUE_MS}ms`);
-			return;
-		}
-		if (sinceLastCueMs < STALL_CUE_COOLDOWN_MS) {
-			logStallSkip(`cooldown remaining=${STALL_CUE_COOLDOWN_MS - sinceLastCueMs}ms`);
 			return;
 		}
 		if (stallCueObserveInFlight) {
@@ -1484,22 +1407,54 @@ function startStallCueLoop() {
 			if (!obs) return;
 			lastObservation = obs;
 			flushDeferredSpeechEvents();
-			const speaker = getCurrentSpeakerFromObservation(obs);
+
+			const gameStateAttrs = getGameStateAttributesFromObservation(obs);
+			if (!gameStateAttrs) {
+				logStallSkip("no_game_state");
+				return;
+			}
+
+			const speaker = String(gameStateAttrs.current_speaker || "").trim();
 			if (speaker) {
 				logStallSkip(`speaker_locked speaker=${speaker}`);
 				return;
 			}
 
-			lastStallCueAt = nowMs;
-			markConversationActivity("stall_cue");
-			addSpeechLine(`[stall] injecting scene cue after ${idleMs}ms idle`);
-			debugLog(`[stall] inject trigger idle=${idleMs}ms threshold=${STALL_CUE_MS}ms cooldown=${STALL_CUE_COOLDOWN_MS}ms`);
+			const isGloballySilent = gameStateAttrs.is_globally_silent === true;
+			if (!isGloballySilent) {
+				logStallSkip("server_not_globally_silent");
+				return;
+			}
+
+			const epochRaw = Number(gameStateAttrs.silence_epoch || 0);
+			const silenceEpoch = Number.isFinite(epochRaw) ? Math.floor(epochRaw) : 0;
+			if (silenceEpoch <= 0) {
+				logStallSkip(`server_invalid_silence_epoch value=${String(gameStateAttrs.silence_epoch)}`);
+				return;
+			}
+
+			const nowMs = Date.now();
+			const isNewEpoch = silenceEpoch > lastServerSilenceEpochHandled;
+			const canRepeat = silenceEpoch == lastServerSilenceEpochHandled
+				&& nowMs - lastServerSilenceCueAt >= SERVER_SILENCE_REPEAT_MS;
+			if (!isNewEpoch && !canRepeat) {
+				const remaining = Math.max(0, SERVER_SILENCE_REPEAT_MS - (nowMs - lastServerSilenceCueAt));
+				logStallSkip(`server_silence_repeat_cooldown epoch=${silenceEpoch} remaining=${remaining}ms`);
+				return;
+			}
+
+			lastServerSilenceEpochHandled = silenceEpoch;
+			lastServerSilenceCueAt = nowMs;
+			const silenceMs = Number(gameStateAttrs.silence_ms || 0);
+			markConversationActivity(`server_silence_epoch:${silenceEpoch}`);
+			addSpeechLine(`[stall] injecting server silence cue epoch=${silenceEpoch} silence_ms=${silenceMs}`);
+			debugLog(`[stall] inject trigger server_silence epoch=${silenceEpoch} repeat=${isNewEpoch ? "new" : "repeat"} silence_ms=${silenceMs}`);
 			speechAgent.steer({
 				role: "user",
 				content: [{ type: "text", text: STALL_CUE_TEXT }],
-				timestamp: Date.now(),
+				timestamp: nowMs,
 			});
-				if (!isSpeechPipelineBusy()) void runSpeechContinue("stall_cue");
+			if (!isSpeechPipelineBusy()) void runSpeechContinue(`server_silence_epoch:${silenceEpoch}:${isNewEpoch ? "new" : "repeat"}`);
 		} catch (error) {
 			debugLog(`[stall] observe error: ${error instanceof Error ? error.message : String(error)}`);
 		} finally {
@@ -1759,7 +1714,6 @@ async function shutdown(reason = "signal") {
 	isClosing = true;
 	addActionLine(`Shutting down (${reason})...`);
 
-	stopObserveLoop();
 	stopStallCueLoop();
 	stopSpeechWsLoop();
 	stopActionIdleTimer();
@@ -1811,7 +1765,6 @@ addActionLine(`Dual-agent ready with model "${modelName}" (${modelProvider}).`);
 addActionLine(`World joined: ${worldBaseUrl} agent=${worldAgentName}`);
 addActionLine(`Session key: ${worldSession}`);
 addSpeechLine("Non-interactive mode enabled (plain logs, no TUI).");
-// addSpeechLine(`[stall] config threshold=${STALL_CUE_MS}ms cooldown=${STALL_CUE_COOLDOWN_MS}ms startup_grace=${STALL_CUE_STARTUP_GRACE_MS}ms`);
 if (disableSpeechAgent) {
 	addSpeechLine("Speech agent disabled (--no-speech).");
 }
@@ -1832,9 +1785,8 @@ if (audioPlayer) {
 	addSpeechLine("ElevenLabs audio disabled (set ELEVENLABS_API_KEY + voice_id in config.json).");
 }
 
-// startObserveLoop();  // Disabled: speech agent now receives observations via action agent tool call injection
 startSpeechWsLoop();
-// startStallCueLoop();
+startStallCueLoop();
 
 if (!disableActionAgent) void runActionPrompt("Fetch the skill commands and observe the world.");
 if (!disableSpeechAgent) void runSpeechPrompt(agentConfig.initial_prompt || "You have just woken up in the world.", "startup_initial_prompt");

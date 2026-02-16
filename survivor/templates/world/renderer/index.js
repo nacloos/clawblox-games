@@ -1,309 +1,437 @@
-import * as THREE from 'https://esm.sh/three@0.160.0'
+/* ───────────────────────────────────────────────────────
+   Tribal Council — Live Visual-Novel Renderer
+   Replaces Three.js renderer with DOM-based overlay
+   driven by spectator WS speech events + onState player data.
+   ─────────────────────────────────────────────────────── */
 
-function rotationToQuaternion(rot) {
-  const m = new THREE.Matrix4()
-  m.set(
-    rot[0][0], rot[0][1], rot[0][2], 0,
-    rot[1][0], rot[1][1], rot[1][2], 0,
-    rot[2][0], rot[2][1], rot[2][2], 0,
-    0, 0, 0, 1,
-  )
-  return new THREE.Quaternion().setFromRotationMatrix(m)
+// ── Character data ──────────────────────────────────────
+const CHARACTERS = {
+  host:          { name: 'Jeff',          color: '#b8860b' },
+  rodger_dodger: { name: 'Rodger Dodger', color: '#8B4513', portrait: '/assets/rodger-calm.JPG' },
+  yasmin:        { name: 'Yasmin',        color: '#E74C3C' },
+  guy:           { name: 'Guy',           color: '#3498DB' },
+  stephanie:     { name: 'Stephanie',     color: '#9B59B6' },
+  tommy:         { name: 'Tommy',         color: '#27AE60' },
 }
 
-function resolveEntityModelUrl(entity) {
-  if (typeof entity.model_url === 'string' && entity.model_url.length > 0) {
-    return entity.model_url
-  }
-  const attrs = entity.attributes
-  if (attrs && typeof attrs.ModelUrl === 'string' && attrs.ModelUrl.length > 0) {
-    return attrs.ModelUrl
-  }
-  return null
+const CHAR_ORDER = ['host', 'rodger_dodger', 'yasmin', 'guy', 'stephanie', 'tommy']
+
+// ── Embedded CSS ────────────────────────────────────────
+const STYLES = `
+/* reset within overlay */
+#sv, #sv * { margin:0; padding:0; box-sizing:border-box; }
+
+#sv {
+  position: fixed; inset: 0; z-index: 9999;
+  font-family: 'Georgia', serif;
+  user-select: none;
+  overflow: hidden;
 }
 
-function buildSky(scene) {
-  const skyMat = new THREE.ShaderMaterial({
-    uniforms: {
-      topColor: { value: new THREE.Color(0x87ceeb) },
-      bottomColor: { value: new THREE.Color(0xffecd2) },
-    },
-    vertexShader: `
-      varying vec3 vWP;
-      void main(){
-        vWP = (modelMatrix * vec4(position, 1.0)).xyz;
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-      }
-    `,
-    fragmentShader: `
-      uniform vec3 topColor, bottomColor;
-      varying vec3 vWP;
-      void main(){
-        float h = normalize(vWP).y;
-        gl_FragColor = vec4(mix(bottomColor, topColor, max(h, 0.0)), 1.0);
-      }
-    `,
-    side: THREE.BackSide,
-    depthWrite: false,
-  })
-  scene.add(new THREE.Mesh(new THREE.SphereGeometry(1500, 32, 32), skyMat))
+/* ── Background ── */
+#sv-bg {
+  position: absolute; inset: 0;
+  background:
+    url('/assets/setting.png') center/cover no-repeat,
+    radial-gradient(ellipse at 50% 80%, #3a1a00 0%, #1a0a00 50%, #000 100%);
+  filter: brightness(0.35) blur(1px);
+  transform: scale(1.03);
+}
+#sv-bg::after {
+  content: "";
+  position: absolute; inset: 0;
+  background: radial-gradient(ellipse at center, transparent 40%, rgba(0,0,0,0.55) 100%);
 }
 
-function buildClouds(scene) {
-  const cloudList = []
-  const cloudMat = new THREE.MeshStandardMaterial({
-    color: 0xffffff,
-    transparent: true,
-    opacity: 0.8,
-    roughness: 1,
-  })
-
-  for (let i = 0; i < 20; i++) {
-    const cg = new THREE.Group()
-    for (let j = 0; j < 3 + Math.floor(Math.random() * 4); j++) {
-      const p = new THREE.Mesh(new THREE.SphereGeometry(6 + Math.random() * 10, 8, 8), cloudMat)
-      p.position.set(j * 8 - 16, Math.random() * 5, Math.random() * 6 - 3)
-      p.scale.y = 0.6
-      cg.add(p)
-    }
-    cg.position.set(Math.random() * 500 - 250, 100 + Math.random() * 80, Math.random() * 300 - 150)
-    scene.add(cg)
-    cloudList.push({ mesh: cg, speed: 0.5 + Math.random() * 1.5 })
-  }
-
-  return cloudList
+/* ── Character row ── */
+#sv-chars {
+  position: absolute; top: 0; left: 0; right: 0; bottom: 28%;
+  display: flex; align-items: flex-end; justify-content: center;
+  gap: 12px; padding: 0 24px 16px;
+  z-index: 10; pointer-events: none;
 }
 
-function updateClouds(clouds, dt) {
-  for (const c of clouds) {
-    c.mesh.position.x += c.speed * dt
-    if (c.mesh.position.x > 250) c.mesh.position.x = -250
-  }
+.sv-char {
+  display: flex; flex-direction: column; align-items: center;
+  transition: filter 0.4s ease, transform 0.4s ease;
+  filter: brightness(0.35) saturate(0.5);
+  transform-origin: bottom center;
+  position: relative;
+}
+.sv-char.speaking {
+  filter: brightness(1) saturate(1) drop-shadow(0 0 18px rgba(255,140,40,0.5));
+  transform: scale(1.08);
+  z-index: 15;
+}
+.sv-char.voted .sv-badge { display: flex; }
+
+/* Silhouette */
+.sv-sil {
+  width: 140px; height: 280px;
+  border-radius: 50px 50px 20px 20px;
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 0 30px rgba(0,0,0,0.5);
+  clip-path: polygon(
+    30% 0%, 70% 0%, 80% 8%, 85% 20%, 83% 35%,
+    95% 45%, 100% 55%, 95% 65%, 80% 60%,
+    82% 75%, 78% 90%, 75% 100%, 25% 100%,
+    22% 90%, 18% 75%, 20% 60%,
+    5% 65%, 0% 55%, 5% 45%, 17% 35%,
+    15% 20%, 20% 8%
+  );
 }
 
-function createEntityVisual(entity) {
-  const role = (entity.render && entity.render.role) || entity.name || ''
-  const size = entity.size || [1, 1, 1]
-  const modelUrl = resolveEntityModelUrl(entity)
-
-  if (modelUrl) {
-    const root = new THREE.Group()
-    root.userData.isModelEntity = true
-    root.userData.modelUrl = modelUrl
-    const fallback = new THREE.Mesh(
-      new THREE.CapsuleGeometry(0.35, 0.5, 8, 16),
-      new THREE.MeshStandardMaterial({ color: 0xffa07a, roughness: 0.5, metalness: 0.05 }),
-    )
-    fallback.castShadow = true
-    fallback.receiveShadow = true
-    const scale = (size[1] || 5) / 1.3
-    fallback.scale.setScalar(scale)
-    root.add(fallback)
-    return root
-  }
-
-  if (role === 'Ground') {
-    const group = new THREE.Group()
-    const mesh = new THREE.Mesh(
-      new THREE.BoxGeometry(size[0], size[1], size[2]),
-      new THREE.MeshStandardMaterial({ color: 0x55efC4, roughness: 0.5, metalness: 0.2 }),
-    )
-    mesh.receiveShadow = true
-    mesh.castShadow = true
-    group.add(mesh)
-    return group
-  }
-
-  if (role === 'Mesa') {
-    const group = new THREE.Group()
-    const w = size[0], h = size[1], d = size[2]
-
-    const layers = [
-      { frac: 0.0,  hFrac: 0.40, color: 0x8b6940 },
-      { frac: 0.40, hFrac: 0.40, color: 0xa57d50 },
-      { frac: 0.80, hFrac: 0.20, color: 0x55cfb0 },
-    ]
-
-    for (const layer of layers) {
-      const lh = h * layer.hFrac
-      const ly = -h / 2 + h * layer.frac + lh / 2
-      const mesh = new THREE.Mesh(
-        new THREE.BoxGeometry(w, lh, d),
-        new THREE.MeshStandardMaterial({ color: layer.color, roughness: 0.9, metalness: 0.0 }),
-      )
-      mesh.position.y = ly
-      mesh.castShadow = true
-      mesh.receiveShadow = true
-      group.add(mesh)
-    }
-
-    return group
-  }
-
-  // Default: box with entity color
-  const color = entity.render && entity.render.color
-    ? (Math.round(entity.render.color[0] * 255) << 16) |
-      (Math.round(entity.render.color[1] * 255) << 8) |
-      Math.round(entity.render.color[2] * 255)
-    : 0x999999
-
-  let geometry
-  const primitive = entity.render && entity.render.primitive
-  if (primitive === 'cylinder') geometry = new THREE.CylinderGeometry(size[0] / 2, size[0] / 2, size[1], 16)
-  else if (primitive === 'sphere') geometry = new THREE.SphereGeometry(size[0] / 2, 16, 16)
-  else geometry = new THREE.BoxGeometry(size[0], size[1], size[2])
-
-  const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ color, roughness: 0.5, metalness: 0.2 }))
-  mesh.castShadow = true
-  mesh.receiveShadow = true
-  return mesh
+/* Portrait image (replaces silhouette) */
+.sv-portrait {
+  height: 280px; width: auto;
+  object-fit: contain;
+  filter: drop-shadow(0 4px 20px rgba(0,0,0,0.7));
 }
 
+.sv-name {
+  margin-top: 6px;
+  color: #fff; font-size: 13px; font-weight: bold;
+  text-shadow: 0 2px 6px rgba(0,0,0,0.9);
+  text-align: center;
+}
+
+/* Vote badge */
+.sv-badge {
+  display: none;
+  position: absolute; top: -4px; right: -4px;
+  width: 28px; height: 28px; border-radius: 50%;
+  background: #27AE60;
+  align-items: center; justify-content: center;
+  font-size: 16px; color: #fff;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.6);
+  z-index: 20;
+}
+
+/* ── Dialogue box ── */
+#sv-dlg {
+  position: absolute; bottom: 0; left: 0; right: 0;
+  height: 28%;
+  background: linear-gradient(to bottom, rgba(0,0,0,0.88), rgba(0,0,0,0.96));
+  border-top: 2px solid rgba(255,140,40,0.4);
+  z-index: 20;
+  padding: 20px 40px;
+  display: flex; flex-direction: column;
+}
+
+#sv-speaker {
+  font-size: 20px; font-weight: bold;
+  text-transform: uppercase; letter-spacing: 2px;
+  margin-bottom: 10px;
+  text-shadow: 0 0 10px currentColor;
+}
+
+#sv-text {
+  color: #e8e0d0; font-size: 18px; line-height: 1.6;
+  flex: 1;
+  text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+  overflow-y: auto;
+}
+
+/* ── Vote HUD ── */
+#sv-hud {
+  position: absolute; top: 16px; right: 20px;
+  z-index: 30;
+  color: rgba(255,255,255,0.7);
+  font-size: 13px; font-family: monospace;
+  text-shadow: 0 1px 4px rgba(0,0,0,0.8);
+}
+#sv-hud-bar {
+  margin-top: 4px;
+  width: 120px; height: 6px;
+  background: rgba(255,255,255,0.15);
+  border-radius: 3px; overflow: hidden;
+}
+#sv-hud-fill {
+  height: 100%; width: 0%;
+  background: #27AE60;
+  border-radius: 3px;
+  transition: width 0.4s ease;
+}
+
+/* ── Speech log ── */
+#sv-log {
+  position: absolute; top: 16px; left: 20px;
+  z-index: 30;
+  max-width: 340px; max-height: 40%;
+  overflow-y: auto; overflow-x: hidden;
+  display: flex; flex-direction: column; gap: 4px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255,255,255,0.2) transparent;
+}
+.sv-log-entry {
+  font-size: 12px; line-height: 1.4;
+  color: rgba(255,255,255,0.45);
+  text-shadow: 0 1px 3px rgba(0,0,0,0.8);
+}
+.sv-log-name {
+  font-weight: bold;
+}
+
+/* ── Title overlay ── */
+#sv-title {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  z-index: 50;
+  text-align: center;
+  transition: opacity 1.2s ease-out;
+  pointer-events: none;
+}
+#sv-title.hidden { opacity: 0; }
+
+#sv-title h1 {
+  font-size: 64px; color: #e8d0a0;
+  letter-spacing: 12px;
+  text-shadow:
+    0 0 40px rgba(255,120,20,0.6),
+    0 0 80px rgba(255,80,0,0.3),
+    0 4px 8px rgba(0,0,0,0.8);
+  animation: sv-glow 3s ease-in-out infinite alternate;
+}
+#sv-title p {
+  margin-top: 12px;
+  font-size: 18px; color: rgba(255,200,140,0.6);
+  font-style: italic; letter-spacing: 4px;
+  text-shadow: 0 2px 6px rgba(0,0,0,0.8);
+}
+
+@keyframes sv-glow {
+  0%   { text-shadow: 0 0 40px rgba(255,120,20,0.4), 0 0 80px rgba(255,80,0,0.2), 0 4px 8px rgba(0,0,0,0.8); }
+  100% { text-shadow: 0 0 60px rgba(255,120,20,0.8), 0 0 120px rgba(255,80,0,0.4), 0 4px 8px rgba(0,0,0,0.8); }
+}
+
+/* ── Responsive ── */
+@media (max-width: 768px) {
+  .sv-sil, .sv-portrait { width: 90px; height: 180px; }
+  #sv-dlg { height: 32%; padding: 14px 18px; }
+  #sv-text { font-size: 15px; }
+  #sv-speaker { font-size: 16px; }
+  #sv-title h1 { font-size: 36px; letter-spacing: 6px; }
+  #sv-log { max-width: 220px; }
+}
+`
+
+// ── Renderer entry point ────────────────────────────────
 export function createRenderer(ctx) {
-  const scene = new THREE.Scene()
+  // Hide the canvas the runtime provides
+  ctx.canvas.style.display = 'none'
+  const parent = ctx.canvas.parentElement || document.body
 
-  const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 3000)
+  // Inject styles
+  const styleEl = document.createElement('style')
+  styleEl.textContent = STYLES
+  document.head.appendChild(styleEl)
 
-  const renderer = new THREE.WebGLRenderer({ canvas: ctx.canvas, antialias: true })
-  renderer.shadowMap.enabled = true
-  renderer.shadowMap.type = THREE.PCFSoftShadowMap
-  renderer.toneMapping = THREE.ACESFilmicToneMapping
-  renderer.toneMappingExposure = 1.2
-  renderer.outputColorSpace = THREE.SRGBColorSpace
+  // Build DOM
+  const root = document.createElement('div')
+  root.id = 'sv'
+  root.innerHTML = `
+    <div id="sv-bg"></div>
+    <div id="sv-chars"></div>
+    <div id="sv-hud">
+      <span id="sv-hud-label"></span>
+      <div id="sv-hud-bar"><div id="sv-hud-fill"></div></div>
+    </div>
+    <div id="sv-log"></div>
+    <div id="sv-dlg">
+      <div id="sv-speaker"></div>
+      <div id="sv-text"></div>
+    </div>
+    <div id="sv-title">
+      <h1>TRIBAL COUNCIL</h1>
+      <p>The tribe has spoken.</p>
+    </div>
+  `
+  parent.appendChild(root)
 
-  // Lights (matching fall-guys)
-  scene.add(new THREE.AmbientLight(0xffffff, 0.6))
-  scene.add(new THREE.HemisphereLight(0x87ceeb, 0x98fb98, 0.4))
+  // Grab DOM refs
+  const $chars    = root.querySelector('#sv-chars')
+  const $speaker  = root.querySelector('#sv-speaker')
+  const $text     = root.querySelector('#sv-text')
+  const $hudLabel = root.querySelector('#sv-hud-label')
+  const $hudFill  = root.querySelector('#sv-hud-fill')
+  const $log      = root.querySelector('#sv-log')
+  const $title    = root.querySelector('#sv-title')
 
-  const dirLight = new THREE.DirectionalLight(0xffffff, 1.2)
-  dirLight.position.set(30, 50, 20)
-  dirLight.castShadow = true
-  dirLight.shadow.mapSize.set(2048, 2048)
-  dirLight.shadow.camera.left = -80
-  dirLight.shadow.camera.right = 80
-  dirLight.shadow.camera.top = 80
-  dirLight.shadow.camera.bottom = -80
-  dirLight.shadow.camera.near = 1
-  dirLight.shadow.camera.far = 200
-  dirLight.shadow.bias = -0.001
-  scene.add(dirLight)
-  scene.add(dirLight.target)
+  // ── State ──
+  let players = []
+  let playersHash = ''
+  let titleVisible = true
+  let typewriterTimer = null
 
-  // Sky and clouds
-  buildSky(scene)
-  const clouds = buildClouds(scene)
-
-  const stateBuffer = ctx.runtime.state.createSnapshotBuffer({ maxSnapshots: 8, interpolationDelayMs: 100 })
-  const entityObjects = new Map()
-  const modelController = ctx.runtime.three.createModelEntityController(THREE, {
-    onError(err, meta) {
-      ctx.log('warn', 'Model entity load failed', { err: String(err), ...meta })
-    },
-  })
-
-  let followTargetPos = new THREE.Vector3(0, 4, 0)
-  let camPos = new THREE.Vector3(0, 15, -20)
-  let camTarget = new THREE.Vector3(0, 2, 0)
-  const clock = new THREE.Clock()
-
-  function updateCamera() {
-    const tp = followTargetPos
-    const ideal = new THREE.Vector3(tp.x, tp.y + 12, tp.z - 20)
-    camPos.lerp(ideal, 0.05)
-    camera.position.copy(camPos)
-    camTarget.lerp(tp.clone().add(new THREE.Vector3(0, 2, 0)), 0.08)
-    camera.lookAt(camTarget)
-    dirLight.position.set(tp.x + 30, 50, tp.z + 20)
-    dirLight.target.position.copy(tp)
+  // ── Helpers ──
+  function charData(agentName) {
+    return CHARACTERS[agentName] || { name: agentName, color: '#888' }
   }
 
-  function updateScene(obs, dt) {
-    const activeIds = new Set()
-    const stateByRootPartId = new Map()
-    for (const player of obs.players || []) {
-      if (typeof player.root_part_id === 'number' && typeof player.humanoid_state === 'string') {
-        stateByRootPartId.set(player.root_part_id, player.humanoid_state)
-      }
+  function hashPlayers(list) {
+    return list.map(p => {
+      const attrs = p.attributes || {}
+      const entries = Object.keys(attrs).sort().map(k => `${k}=${attrs[k]}`).join(',')
+      return `${p.name}:${entries}`
+    }).join('|')
+  }
+
+  function playerHasVoted(p) {
+    const attrs = p.attributes
+    return attrs && attrs.HasVoted === true
+  }
+
+  // ── Render characters ──
+  function renderCharacters() {
+    $chars.innerHTML = ''
+    // Order: show chars in CHAR_ORDER that exist in players, then any extras
+    const playerMap = new Map()
+    for (const p of players) playerMap.set(p.name, p)
+
+    const ordered = []
+    for (const key of CHAR_ORDER) {
+      if (playerMap.has(key)) ordered.push(playerMap.get(key))
+    }
+    for (const p of players) {
+      if (!CHAR_ORDER.includes(p.name)) ordered.push(p)
     }
 
-    for (const entity of obs.entities || []) {
-      activeIds.add(entity.id)
-      let obj = entityObjects.get(entity.id)
-      if (!obj) {
-        obj = createEntityVisual(entity)
-        entityObjects.set(entity.id, obj)
-        scene.add(obj)
+    for (const p of ordered) {
+      const cd = charData(p.name)
+      const hasVoted = playerHasVoted(p)
+      const isSpeaking = p.attributes?.IsSpeaking === true
+
+      const el = document.createElement('div')
+      el.className = 'sv-char'
+      if (isSpeaking) el.classList.add('speaking')
+      if (hasVoted)   el.classList.add('voted')
+
+      if (cd.portrait) {
+        const img = document.createElement('img')
+        img.className = 'sv-portrait'
+        img.src = cd.portrait
+        img.alt = cd.name
+        el.appendChild(img)
+      } else {
+        const sil = document.createElement('div')
+        sil.className = 'sv-sil'
+        sil.style.backgroundColor = cd.color
+        el.appendChild(sil)
       }
 
-      obj.position.set(entity.position[0], entity.position[1], entity.position[2])
-      if (entity.rotation) obj.quaternion.copy(rotationToQuaternion(entity.rotation))
-      obj.visible = !(entity.render && entity.render.visible === false)
+      const badge = document.createElement('div')
+      badge.className = 'sv-badge'
+      badge.textContent = '\u2713'
+      el.appendChild(badge)
 
-      const prev = obj.userData.prevPos
-      let speed = 0
-      if (prev) {
-        const dx = entity.position[0] - prev[0]
-        const dz = entity.position[2] - prev[2]
-        speed = Math.sqrt(dx * dx + dz * dz) / Math.max(dt, 0.001)
-      }
-      obj.userData.prevPos = [entity.position[0], entity.position[1], entity.position[2]]
+      const nameTag = document.createElement('div')
+      nameTag.className = 'sv-name'
+      nameTag.textContent = cd.name
+      el.appendChild(nameTag)
 
-      if (obj.userData && obj.userData.isModelEntity) {
-        const modelUrl = resolveEntityModelUrl(entity)
-        if (modelUrl) {
-          void modelController.upsert({
-            entityId: entity.id,
-            root: obj,
-            modelUrl,
-            size: entity.size || [2, 5, 2],
-            yawOffsetDeg: entity.model_yaw_offset_deg,
-          })
-          modelController.update(entity.id, {
-            dt,
-            speed,
-            humanoidState: stateByRootPartId.get(entity.id) || null,
-          })
-        }
-      }
-    }
-
-    for (const [id, obj] of entityObjects.entries()) {
-      if (!activeIds.has(id)) {
-        scene.remove(obj)
-        modelController.remove(id)
-        entityObjects.delete(id)
-      }
-    }
-
-    const players = obs.players || []
-    if (players.length > 0) {
-      const target = players[0]
-      followTargetPos.set(target.position[0], target.position[1], target.position[2])
+      $chars.appendChild(el)
     }
   }
 
+  // ── Vote HUD ──
+  function updateVoteHud() {
+    const total = players.length
+    if (total === 0) {
+      $hudLabel.textContent = ''
+      $hudFill.style.width = '0%'
+      return
+    }
+    const voted = players.filter(p => playerHasVoted(p)).length
+    $hudLabel.textContent = `Votes: ${voted} / ${total}`
+    $hudFill.style.width = `${Math.round((voted / total) * 100)}%`
+  }
+
+  // ── Speech display ──
+  function showSpeech(speaker, text) {
+    if (titleVisible) {
+      titleVisible = false
+      $title.classList.add('hidden')
+    }
+
+    const cd = charData(speaker)
+    $speaker.textContent = cd.name
+    $speaker.style.color = cd.color
+
+    // Typewriter
+    if (typewriterTimer) clearInterval(typewriterTimer)
+    $text.textContent = ''
+    let i = 0
+    typewriterTimer = setInterval(() => {
+      if (i < text.length) {
+        $text.textContent += text[i]
+        i++
+      } else {
+        clearInterval(typewriterTimer)
+        typewriterTimer = null
+      }
+    }, 25)
+  }
+
+  function appendLog(speaker, text) {
+    const cd = charData(speaker)
+    const entry = document.createElement('div')
+    entry.className = 'sv-log-entry'
+
+    const nameSpan = document.createElement('span')
+    nameSpan.className = 'sv-log-name'
+    nameSpan.style.color = cd.color
+    nameSpan.textContent = cd.name + ': '
+    entry.appendChild(nameSpan)
+
+    const textNode = document.createTextNode(text.length > 120 ? text.slice(0, 117) + '...' : text)
+    entry.appendChild(textNode)
+
+    $log.appendChild(entry)
+    $log.scrollTop = $log.scrollHeight
+  }
+
+  // ── Renderer lifecycle ──
   return {
-    onResize({ width, height }) {
-      camera.aspect = width / Math.max(1, height)
-      camera.updateProjectionMatrix()
-      renderer.setSize(width, height, false)
+    onState(state) {
+      // Speech events arrive as {type: "speech", speaker, text, seq}
+      if (state.type === 'speech') {
+        appendLog(state.speaker, state.text)
+        showSpeech(state.speaker, state.text)
+        return
+      }
+
+      // Normal spectator state frame
+      const newPlayers = state.players || []
+      const h = hashPlayers(newPlayers)
+      if (h !== playersHash) {
+        // Log IsSpeaking changes
+        for (const np of newPlayers) {
+          const old = players.find(p => p.name === np.name)
+          const wasSpeaking = old?.attributes?.IsSpeaking === true
+          const nowSpeaking = np.attributes?.IsSpeaking === true
+          if (nowSpeaking && !wasSpeaking) {
+            console.log(`[speaking] ${np.name} claimed speaking lock`)
+          } else if (!nowSpeaking && wasSpeaking) {
+            console.log(`[speaking] ${np.name} released speaking lock`)
+          }
+        }
+        players = newPlayers
+        playersHash = h
+        renderCharacters()
+        updateVoteHud()
+      }
     },
 
-    onState(state) {
-      stateBuffer.push(state)
-      const obs = stateBuffer.interpolated() || state
-      const dt = Math.min(clock.getDelta(), 0.05)
-      updateClouds(clouds, dt)
-      updateScene(obs, dt)
-      updateCamera()
-      renderer.render(scene, camera)
+    onResize() {
+      // DOM-based, nothing to do
     },
 
     unmount() {
-      for (const obj of entityObjects.values()) scene.remove(obj)
-      entityObjects.clear()
-      modelController.clear()
-      renderer.dispose()
+      if (typewriterTimer) clearInterval(typewriterTimer)
+      root.remove()
+      styleEl.remove()
+      ctx.canvas.style.display = ''
     },
   }
 }

@@ -260,10 +260,12 @@ function popTtsEmitText(buffer) {
 }
 
 class ElevenLabsMultiContextPlayer {
-	constructor({ apiKey, voiceId, modelId = "eleven_flash_v2_5", audioUrl, sessionToken }) {
+	constructor({ apiKey, voiceId, modelId = "eleven_flash_v2_5", audioUrl, sessionToken, onError, speed = 1.0 }) {
 		this.apiKey = apiKey;
 		this.voiceId = voiceId;
 		this.modelId = modelId;
+		this.speed = speed;
+		this.onError = onError || (() => {});
 		this.audioUrl = audioUrl;
 		this.sessionToken = sessionToken;
 		this.closed = false;
@@ -302,10 +304,13 @@ class ElevenLabsMultiContextPlayer {
 				this._handleMessage(event.data);
 			});
 
-			this.ws.addEventListener("close", () => {
+			this.ws.addEventListener("close", (ev) => {
 				this.wsReady = false;
 				this._stopKeepAlive();
 				this._completeAllContexts();
+				if (!this.closed && ev.code !== 1000) {
+					this.onError(`[audio] WS closed (code=${ev.code} reason=${ev.reason || "unknown"})`);
+				}
 				if (!this.closed) {
 					setTimeout(() => {
 						this.reconnectDelay = Math.min(this.reconnectDelay * 2, 10000);
@@ -352,7 +357,11 @@ class ElevenLabsMultiContextPlayer {
 			this._completeContext(contextId);
 		}
 
-		if (!data.audio && !data.isFinal && !data.is_final) {
+		if (data.error || data.message) {
+			const errMsg = data.error || data.message;
+			debugLog(`ElevenLabs error: ${errMsg}`);
+			this.onError(`[audio] ${errMsg}`);
+		} else if (!data.audio && !data.isFinal && !data.is_final) {
 			debugLog(`WS unknown msg keys=${Object.keys(data).join(",")}`);
 		}
 	}
@@ -412,7 +421,7 @@ class ElevenLabsMultiContextPlayer {
 			this._wsSend({
 				context_id: contextId,
 				text: "",
-				voice_settings: { stability: 0.45, similarity_boost: 0.8, use_speaker_boost: true },
+				voice_settings: { stability: 0.45, similarity_boost: 0.8, use_speaker_boost: true, speed: this.speed },
 			});
 		}
 		this._streamingBuffer += chunk;
@@ -600,6 +609,7 @@ const actionSystemPromptPath = path.join(resultsDir, "system-prompt-action.md");
 const agentDir = path.join(gameDir, "workspace", agentName);
 const agentTemplateDir = path.join(gameDir, "templates", "agents", agentName);
 const defaultTemplateDir = path.join(gameDir, "templates", "agent");
+const worldTemplateDir = path.join(gameDir, "templates", "world");
 function listMdFiles(dir) {
 	if (!existsSync(dir)) return [];
 	return readdirSync(dir).filter((f) => f.endsWith(".md"));
@@ -672,6 +682,14 @@ function buildWorkspaceContext() {
 		const content = loadContextFile(file);
 		if (content) lines.push("---", "", `**${file}** (${filePath})`, "", content, "");
 	}
+	const worldMdFiles = listMdFiles(worldTemplateDir);
+	if (worldMdFiles.length > 0) {
+		lines.push("---", "", "# World Reference (read-only)", "");
+		for (const file of worldMdFiles) {
+			const content = readFileSync(path.join(worldTemplateDir, file), "utf8").trim();
+			if (content) lines.push(`**${file}**`, "", content, "");
+		}
+	}
 	return lines.join("\n");
 }
 
@@ -721,9 +739,10 @@ await joinWorldOrThrow();
 const speechSystemPrompt = [
 	"You are a being living in your world.",
 	"Always use the tags <speak>...</speak> to speak out loud. No one will hear what you say outside of these tags.",
-	// "Use <silence></silence> to say nothing.",
+	"Use <silence></silence> to say nothing. Only speak when addressed or you have something important to add.",
 	"If SOUL.md is present, embody its persona and tone when speaking.",
-	"Max 1-2 sentences in speak tags.",
+	// "Max 1-2 sentences in speak tags.",
+	"Keep it short and concise when speaking (max 1 sentence) unless the situation really calls for it.",
 	"",
 	"You will receive act_in_world tool results describing actions and observations in the world",
 	"React to them if you are not already talking to someone.",
@@ -812,6 +831,7 @@ let speechIntentBuffer = [];
 let speechStreamText = "";
 let ttsInsideSpeak = false; // true while accumulating text inside <speak>/<s> tag
 let ttsSpeakAccum = ""; // full text of current speak segment (for speech channel + logging)
+let ttsSpeakClaimPromise = null; // promise from claimSpeaking() for current speak segment
 
 function startActionIdleTimer() {
 	stopActionIdleTimer();
@@ -841,6 +861,7 @@ const audioPlayer =
 				modelId: elevenLabsModelId,
 				audioUrl: `${worldBaseUrl}/audio`,
 				sessionToken: worldSession,
+				onError: (msg) => addSpeechLine(msg),
 			})
 		: null;
 
@@ -959,6 +980,31 @@ async function postSpeechToServer(text) {
 		});
 	} catch (err) {
 		console.error(`[speech] post error: ${err instanceof Error ? err.message : String(err)}`);
+	}
+}
+
+async function claimSpeaking() {
+	const res = await fetch(`${worldBaseUrl}/input`, {
+		method: "POST",
+		headers: { "X-Session": worldSession, "Content-Type": "application/json" },
+		body: JSON.stringify({ type: "ClaimSpeaking" }),
+	});
+	if (!res.ok) throw new Error(`ClaimSpeaking failed: ${res.status} ${res.statusText}`);
+	const obs = await res.json();
+	const claimed = obs?.player?.attributes?.IsSpeaking === true;
+	debugLog(`claimSpeaking: claimed=${claimed} player_attrs=${JSON.stringify(obs?.player?.attributes)}`);
+	return claimed;
+}
+
+async function releaseSpeaking() {
+	try {
+		await fetch(`${worldBaseUrl}/input`, {
+			method: "POST",
+			headers: { "X-Session": worldSession, "Content-Type": "application/json" },
+			body: JSON.stringify({ type: "ReleaseSpeaking" }),
+		});
+	} catch (err) {
+		debugLog(`releaseSpeaking error: ${err instanceof Error ? err.message : String(err)}`);
 	}
 }
 
@@ -1098,6 +1144,7 @@ speechAgent.subscribe((event) => {
 		speechStreamText = "";
 		ttsInsideSpeak = false;
 		ttsSpeakAccum = "";
+		ttsSpeakClaimPromise = null;
 		state.speechLiveLine = "assistant>";
 		tui.requestRender();
 		return;
@@ -1118,22 +1165,29 @@ speechAgent.subscribe((event) => {
 				speechStreamText = speechStreamText.slice(openMatch.index + openMatch[0].length);
 				ttsInsideSpeak = true;
 				ttsSpeakAccum = "";
+				ttsSpeakClaimPromise = claimSpeaking();
 			}
 			// We're inside a speak tag — look for closing tag
 			const closeMatch = speechStreamText.match(/<\/(?:speak|s)>/);
 			if (closeMatch) {
-				// Send text before the closing tag
 				const inner = speechStreamText.slice(0, closeMatch.index);
 				if (inner) audioPlayer?.sendTextChunk(inner);
 				ttsSpeakAccum += inner;
 				speechStreamText = speechStreamText.slice(closeMatch.index + closeMatch[0].length);
 				ttsInsideSpeak = false;
-				// Flush this speak segment to ElevenLabs
 				addSpeechLine(`[speak] ${ttsSpeakAccum.slice(0, 80)}`);
-				// Wait for TTS audio to finish, then announce speech to other agents
 				const spokenText = ttsSpeakAccum;
 				ttsSpeakAccum = "";
-				audioPlayer?.flushStream({ trimMs: playbackTrimMs }).then(() => postSpeechToServer(spokenText));
+				const claimP = ttsSpeakClaimPromise;
+				ttsSpeakClaimPromise = null;
+				const flushP = audioPlayer?.flushStream({ trimMs: playbackTrimMs });
+				(claimP || Promise.resolve(true)).then(async (claimed) => {
+					if (!claimed) { audioPlayer?.interrupt(); return; }
+					await (flushP || Promise.resolve());
+					postSpeechToServer(spokenText);
+					if (playbackTrimMs > 0) await sleep(playbackTrimMs);
+					releaseSpeaking();
+				});
 			} else {
 				// No closing tag yet — send what we have so far as incremental text
 				if (speechStreamText.length > 0) {
@@ -1160,18 +1214,28 @@ speechAgent.subscribe((event) => {
 				audioPlayer?.sendTextChunk(speechStreamText);
 				ttsSpeakAccum += speechStreamText;
 			}
-			// Wait for TTS audio to finish, then announce speech to other agents
 			const spokenText = ttsSpeakAccum;
+			const claimP = ttsSpeakClaimPromise;
+			ttsSpeakClaimPromise = null;
 			if (spokenText.trim()) {
-				audioPlayer?.flushStream({ trimMs: playbackTrimMs }).then(() => postSpeechToServer(spokenText));
 				addSpeechLine(`[speak] ${spokenText.slice(0, 80)}`);
+				const flushP = audioPlayer?.flushStream({ trimMs: playbackTrimMs });
+				(claimP || Promise.resolve(true)).then(async (claimed) => {
+					if (!claimed) { audioPlayer?.interrupt(); return; }
+					await (flushP || Promise.resolve());
+					postSpeechToServer(spokenText);
+					if (playbackTrimMs > 0) await sleep(playbackTrimMs);
+					releaseSpeaking();
+				});
 			} else {
 				audioPlayer?.flushStream();
+				if (claimP) claimP.then(claimed => { if (claimed) releaseSpeaking(); });
 			}
 		}
 		speechStreamText = "";
 		ttsInsideSpeak = false;
 		ttsSpeakAccum = "";
+		ttsSpeakClaimPromise = null;
 
 		const intents = extractIntents(fullText);
 		if (intents.length > 0) speechIntentBuffer.push(...intents);
@@ -1398,4 +1462,4 @@ void speechPollLoop();
 tui.start();
 
 if (!disableActionAgent) void runActionPrompt("Fetch the skill commands and observe the world.");
-if (!disableSpeechAgent) void runSpeechPrompt("You have just woken up in the world.");
+if (!disableSpeechAgent) void runSpeechPrompt(agentConfig.initial_prompt || "You have just woken up in the world.");

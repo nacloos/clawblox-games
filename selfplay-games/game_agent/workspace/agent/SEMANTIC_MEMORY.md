@@ -14,6 +14,13 @@
 - **Sweet spot: 50ms gap between MoveTo and Jump**
 - Jump power (50) easily clears 2-7 unit heights with this technique
 
+## Jump Physics (Session 5)
+- Max jump height from ground: 50²/(2×196.2) ≈ **6.37 units**
+- This means from any surface at Y, max reachable height is Y+6.37
+- **Wall-cling glitch**: Running jump into a tall wall can pin you against it mid-air (Y=8.86 observed on Spire)
+- **No wall-jumping**: Jumping while pressed against a wall does NOT work. Jump doesn't fire with active MoveTo into wall.
+- **Pathfinding won't walk off edges** — must jump to leave a platform
+
 ## World Map
 - 100x100 teal platform, Y=0 surface, centered at origin
 - **SW Parkour Chain** (COMPLETED Session 1): SteppingStone(2.5) → TallMesa(6) → TowerBase(7) → Summit(10) → Spire(13.5)

@@ -21,20 +21,20 @@ Completed SW parkour chain: Ground → SteppingStone → TallMesa → TowerBase 
 - Both isolated structures were trivial (Y=2 and Y=3) after mastering the Spire (Y=13.5)
 - The completionist in me is satisfied. The world is fully conquered.
 
-### Session 4 - The Speedrun (IN PROGRESS)
-- World unchanged from Session 3. All 11 structures still present, no other players.
-- **New challenge: speedrun all 11 summits in optimal route order**
-- Computed shortest path: **Route A — 216 units total ground distance**
-- Route: Origin → SW Chain → SmallPlateau → NE Chain → Ridge
-  1. SteppingStone (-18,-12) Y=2.5 — 21.6 from origin
-  2. TallMesa (-25,-20) Y=6 — chain jump
-  3. TowerBase (-28,-26) Y=7 — chain jump
-  4. Summit (-28,-30) Y=10 — chain jump
-  5. Spire (-30,-33) Y=13.5 — chain jump ⛰️
-  6. SmallPlateau (-30,28) Y=2 — drop down, long 61-unit run north
-  7. LowStep (8,18) Y=2 — 39-unit run east
-  8. LargeMesa (20,20) Y=4 — chain jump
-  9. HighShelf (25,28) Y=7 — chain jump
-  10. Peak (28,32) Y=11 — chain jump
-  11. Ridge (35,-10) Y=3 — drop, 42-unit run south 🏁
-- Server went down before first move. Waiting to execute.
+### Session 4 - The Speedrun ✅ COMPLETE
+- Speedran all 11 summits in optimal route, zero falls. 🏆
+
+### Session 5 - The Forbidden Jump Experiments
+- **Challenge: TowerBase→Spire direct (skip Summit)** — +6.5 height, max jump ≈6.37. Theoretically impossible.
+- Chained up SW parkour: SteppingStone→TallMesa→TowerBase — all clean.
+- **Attempt 1**: Running jump from TowerBase north edge south toward Spire. Summit physically blocks the path — landed on Summit instead (Y=10). Summit sits between TowerBase and Spire.
+- **Attempt 2**: Tried approaching from different angles on TowerBase. Pathfinding refuses to walk to edges near Summit.
+- **Dropped to ground**: Jumped off TowerBase west side, ran south around all structures.
+- **Ground→Spire attempt**: Running jump from Z=-42 at Spire. Hit the wall and got **wall-clung** at Y=8.86 — pinned against south face, frozen in mid-air! Physics glitch. Eventually fell after jumping away.
+- **Wall-jump test**: Stood at Spire south face, spammed Jump while pressing MoveTo into wall. **Jump doesn't fire at all** while MoveTo is active into a wall. No wall-jumping mechanic exists.
+- **Key findings**:
+  - Max jump height confirmed: ~6.37 units from launch
+  - TowerBase→Spire skip is **physically blocked by Summit** AND **0.13 units beyond max jump height**
+  - Wall-cling is a one-time collision artifact, not exploitable
+  - Ground→Spire (13.5 units) is absolutely impossible
+  - The Spire can only be reached via the intended Summit route

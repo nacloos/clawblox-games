@@ -1,4 +1,4 @@
--- The world
+-- Survivor — Tribal Council voting server
 
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
@@ -19,32 +19,55 @@ ground.Color = Color3.fromRGB(85, 239, 196)
 ground:SetAttribute("RenderRole", "Ground")
 ground.Parent = Workspace
 
-local mesas = {
-    -- Ground-level formations
-    { name = "LowStep",       size = {8, 2, 10},     pos = {8, 1, 18} },
-    { name = "LargeMesa",     size = {20, 4, 16},    pos = {20, 2, 20} },
-    { name = "SmallPlateau",  size = {10, 2, 8},     pos = {-30, 1, 28} },
-    { name = "SteppingStone", size = {8, 2.5, 8},    pos = {-18, 1.25, -12} },
-    { name = "Ridge",         size = {6, 3, 25},     pos = {35, 1.5, -10} },
-    { name = "TallMesa",      size = {12, 6, 10},    pos = {-25, 3, -20} },
-    -- NE climbing path: large mesa (4) -> high shelf (7) -> peak (11)
-    { name = "HighShelf",     size = {10, 7, 8},     pos = {25, 3.5, 28} },
-    { name = "Peak",          size = {5, 11, 5},     pos = {28, 5.5, 32} },
-    -- SW climbing path: tall mesa (6) -> tower base (7) -> summit (10) -> spire (13.5)
-    { name = "TowerBase",     size = {8, 7, 8},      pos = {-28, 3.5, -26} },
-    { name = "Summit",        size = {6, 10, 6},     pos = {-28, 5, -30} },
-    { name = "Spire",         size = {4, 13.5, 4},   pos = {-30, 6.75, -33} },
-}
+--------------------------------------------------------------------------------
+-- GAME STATE
+--------------------------------------------------------------------------------
 
-for _, m in ipairs(mesas) do
-    local mesa = Instance.new("Part")
-    mesa.Name = m.name
-    mesa.Size = Vector3.new(m.size[1], m.size[2], m.size[3])
-    mesa.Position = Vector3.new(m.pos[1], m.pos[2], m.pos[3])
-    mesa.Anchored = true
-    mesa.Color = Color3.fromRGB(200, 160, 100)
-    mesa:SetAttribute("RenderRole", "Mesa")
-    mesa.Parent = Workspace
+local gameState = Instance.new("Folder")
+gameState.Name = "GameState"
+gameState:SetAttribute("phase", "voting")
+gameState:SetAttribute("votes_received", 0)
+gameState:SetAttribute("total_voters", 0)
+gameState:SetAttribute("result", "")
+gameState:SetAttribute("current_speaker", "")
+gameState:SetAttribute("speaker_claimed_at", 0)
+gameState.Parent = Workspace
+
+local votes = {}       -- private: { [playerName] = targetName }
+local idolPlays = {}   -- private: { [playerName] = targetName }
+
+local function countVoters()
+    local n = 0
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Name ~= "host" then n = n + 1 end
+    end
+    gameState:SetAttribute("total_voters", n)
+end
+
+local function tallyVotes()
+    local counts = {}
+    for voter, target in pairs(votes) do
+        local dominated = false
+        for _, idolTarget in pairs(idolPlays) do
+            if idolTarget == target then dominated = true; break end
+        end
+        if not dominated then
+            counts[target] = (counts[target] or 0) + 1
+        end
+    end
+
+    local maxName, maxCount = "", 0
+    for name, count in pairs(counts) do
+        if count > maxCount then maxName, maxCount = name, count end
+    end
+
+    local parts = {}
+    for voter, target in pairs(votes) do
+        table.insert(parts, voter .. ":" .. target)
+    end
+    gameState:SetAttribute("result",
+        "eliminated:" .. maxName .. "|" .. table.concat(parts, ","))
+    gameState:SetAttribute("phase", "result")
 end
 
 --------------------------------------------------------------------------------
@@ -72,44 +95,67 @@ local function setupPlayer(player)
             hrp.Position = Vector3.new(0, 5, 0)
         end
     end
+
+    countVoters()
 end
 
 local function cleanupPlayer(player)
+    countVoters()
 end
 
 --------------------------------------------------------------------------------
 -- INPUT HANDLING
 --------------------------------------------------------------------------------
 
-local function getHumanoid(player)
-    local character = player.Character
-    if character then
-        return character:FindFirstChild("Humanoid")
-    end
-    return nil
-end
-
-if AgentInputService then
-    AgentInputService.InputReceived:Connect(function(player, inputType, inputData)
-        local humanoid = getHumanoid(player)
-        if not humanoid then return end
-
-        if inputType == "MoveTo" and inputData and inputData.position then
-            local pos = inputData.position
-            humanoid:MoveTo(Vector3.new(pos[1], pos[2], pos[3]))
-        elseif inputType == "Stop" then
-            humanoid:CancelMoveTo()
-        elseif inputType == "Jump" then
-            humanoid.Jump = true
+AgentInputService.InputReceived:Connect(function(player, inputType, inputData)
+    if inputType == "Vote" and inputData and inputData.target then
+        if player.Name == "host" then return end
+        if votes[player.Name] then return end  -- already voted
+        votes[player.Name] = inputData.target
+        player:SetAttribute("HasVoted", true)
+        local received = gameState:GetAttribute("votes_received") + 1
+        gameState:SetAttribute("votes_received", received)
+        if received >= gameState:GetAttribute("total_voters") then
+            tallyVotes()
         end
-    end)
-end
+    elseif inputType == "UseIdol" and inputData and inputData.target then
+        idolPlays[player.Name] = inputData.target
+    elseif inputType == "ClaimSpeaking" then
+        local speaker = gameState:GetAttribute("current_speaker")
+        if speaker == "" or speaker == nil then
+            gameState:SetAttribute("current_speaker", player.Name)
+            gameState:SetAttribute("speaker_claimed_at", tick())
+            player:SetAttribute("IsSpeaking", true)
+        end
+    elseif inputType == "ReleaseSpeaking" then
+        if gameState:GetAttribute("current_speaker") == player.Name then
+            gameState:SetAttribute("current_speaker", "")
+            gameState:SetAttribute("speaker_claimed_at", 0)
+            player:SetAttribute("IsSpeaking", false)
+        end
+    end
+end)
 
 --------------------------------------------------------------------------------
 -- MAIN LOOP
 --------------------------------------------------------------------------------
 
 RunService.Heartbeat:Connect(function(dt)
+    -- Auto-release speaking lock after 15s (safety valve for crashed agents)
+    local speaker = gameState:GetAttribute("current_speaker")
+    if speaker and speaker ~= "" then
+        local claimedAt = gameState:GetAttribute("speaker_claimed_at")
+        if claimedAt > 0 and tick() - claimedAt > 15 then
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p.Name == speaker then
+                    p:SetAttribute("IsSpeaking", false)
+                    break
+                end
+            end
+            gameState:SetAttribute("current_speaker", "")
+            gameState:SetAttribute("speaker_claimed_at", 0)
+        end
+    end
 end)
 
 --------------------------------------------------------------------------------
@@ -123,4 +169,6 @@ for _, player in ipairs(Players:GetPlayers()) do
     setupPlayer(player)
 end
 
-print("=== Flat World ===")
+countVoters()
+
+print("=== Survivor — Tribal Council ===")

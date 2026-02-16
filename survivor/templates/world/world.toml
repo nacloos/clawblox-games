@@ -1,7 +1,7 @@
 name = "World"
 description = "The world"
 # max_players = 1
-max_players = 2
+max_players = 6
 game_type = "lua"
 
 [scripts]

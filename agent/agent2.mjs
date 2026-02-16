@@ -1200,9 +1200,6 @@ let speechLastSeq = 0;
 const playbackDoneWaiters = new Map(); // stream_id -> { resolve }
 const completedPlaybackStreams = new Map(); // stream_id -> playback_done payload
 const pendingSpeechEvents = [];
-const UI_PREVIEW_PREFIX = "[[ui_preview]] ";
-let previewLastSentAt = 0;
-let previewLastText = "";
 const STALL_CUE_MS = Number(process.env.STALL_CUE_MS || "10000");
 const STALL_CUE_COOLDOWN_MS = Number(process.env.STALL_CUE_COOLDOWN_MS || "4000");
 const STALL_CUE_STARTUP_GRACE_MS = Number(process.env.STALL_CUE_STARTUP_GRACE_MS || "1500");
@@ -1238,33 +1235,6 @@ function scheduleSpeechWsReconnect() {
 	}, 1000);
 }
 
-async function postSpeechToServer(text, { preview = false } = {}) {
-	if (!worldSession) return;
-	const cleaned = String(text || "").trim();
-	if (!cleaned) return;
-	const payloadText = preview ? `${UI_PREVIEW_PREFIX}${cleaned}` : cleaned;
-	try {
-		await fetch(`${worldBaseUrl}/speech`, {
-			method: "POST",
-			headers: { "X-Session": worldSession, "Content-Type": "application/json" },
-			body: JSON.stringify({ text: payloadText }),
-		});
-	} catch (err) {
-		debugLog(`[speech] post error: ${err instanceof Error ? err.message : String(err)}`);
-	}
-}
-
-function maybePostSpeechPreview(text, force = false) {
-	const cleaned = String(text || "").trim();
-	if (!cleaned) return;
-	const nowMs = Date.now();
-	if (!force && nowMs - previewLastSentAt < 120) return;
-	if (!force && cleaned === previewLastText) return;
-	previewLastSentAt = nowMs;
-	previewLastText = cleaned;
-	void postSpeechToServer(cleaned, { preview: true });
-}
-
 function flushDeferredSpeechEvents() {
 	if (pendingSpeechEvents.length === 0) return;
 	const currentSpeaker = getCurrentSpeakerFromObservation(lastObservation);
@@ -1288,7 +1258,6 @@ function handleSpeechEvent(ev) {
 		if (seq <= speechLastSeq) return;
 		speechLastSeq = seq;
 	}
-	if (typeof ev.text === "string" && ev.text.startsWith(UI_PREVIEW_PREFIX)) return;
 	if (ev.speaker === worldAgentName) {
 		// Ignore own speech events for stall timing.
 		// Self timing is anchored strictly to explicit playback_done WS events.
@@ -1493,8 +1462,6 @@ speechAgent.subscribe(async (event) => {
 			ttsCanStream = false;
 			ttsPendingText = "";
 			ttsClaimPromise = null;
-		previewLastSentAt = 0;
-		previewLastText = "";
 		state.speechLiveLine = "assistant>";
 		requestRender();
 		return;
@@ -1575,7 +1542,6 @@ speechAgent.subscribe(async (event) => {
 							else ttsPendingText += inner;
 						}
 						ttsSpeakAccum += inner;
-						if (ttsCanStream) maybePostSpeechPreview(ttsSpeakAccum);
 						speechStreamText = speechStreamText.slice(closeMatch.index + closeMatch[0].length);
 						ttsInsideSpeak = false;
 					} else {
@@ -1584,7 +1550,6 @@ speechAgent.subscribe(async (event) => {
 							if (ttsCanStream) audioPlayer?.sendTextChunk(speechStreamText);
 							else ttsPendingText += speechStreamText;
 							ttsSpeakAccum += speechStreamText;
-							if (ttsCanStream) maybePostSpeechPreview(ttsSpeakAccum);
 						}
 						speechStreamText = "";
 						break;
@@ -1643,7 +1608,6 @@ speechAgent.subscribe(async (event) => {
 						if (spokenText.trim()) {
 							markConversationActivity("self_spoke");
 							addSpeechLine(`[speak] ${spokenText.slice(0, 80)}`);
-							if (claimed) maybePostSpeechPreview(spokenText, true);
 						}
 						if (audioPlayer) {
 							await waitForSelfPlaybackDone(streamId);

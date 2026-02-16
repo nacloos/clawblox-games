@@ -38,6 +38,10 @@ gameState:SetAttribute("silence_ms", 0)
 gameState:SetAttribute("is_globally_silent", false)
 gameState:SetAttribute("silence_epoch", 0)
 gameState:SetAttribute("silence_threshold_ms", 8000)
+gameState:SetAttribute("pending_speakers", 0)
+gameState:SetAttribute("current_turn_stream_id", "")
+gameState:SetAttribute("current_turn_lease_id", "")
+gameState:SetAttribute("current_lease_expires_at_ms", 0)
 gameState.Parent = Workspace
 
 local votes = {}       -- private: { [playerName] = targetName }
@@ -83,6 +87,10 @@ end
 --------------------------------------------------------------------------------
 
 local function setupPlayer(player)
+    player:SetAttribute("IsSpeaking", false)
+    player:SetAttribute("SpeechStreamId", "")
+    player:SetAttribute("SpeechLeaseId", "")
+
     local humanoid = nil
     local character = player.Character
     if character then
@@ -108,6 +116,9 @@ local function setupPlayer(player)
 end
 
 local function cleanupPlayer(player)
+    player:SetAttribute("IsSpeaking", false)
+    player:SetAttribute("SpeechStreamId", "")
+    player:SetAttribute("SpeechLeaseId", "")
     countVoters()
 end
 
@@ -119,26 +130,38 @@ local speechBus = Instance.new("RemoteEvent")
 speechBus.Name = "SpeechBus"
 speechBus.Parent = ReplicatedStorage
 
-local activeSpeechStreams = {}  -- stream_id -> { speaker = name, release_at_ms = number? }
+local activeTurn = nil          -- { player_name, stream_id, lease_id, lease_expires_at_ms, finalized, release_at_ms, last_heartbeat_ms, last_progress_seq, last_progress_at_ms }
+local pendingSpeechQueue = {}   -- array of { player_name = string, stream_id = string, requested_at_ms = number }
+local pendingByPlayer = {}      -- player_name -> stream_id
 local SILENCE_THRESHOLD_MS = 8000
 local DEFAULT_SAMPLE_RATE_HZ = 24000
 local DEFAULT_CHANNELS = 1
 local DEFAULT_BYTES_PER_SAMPLE = 2
 local DEFAULT_PLAYBACK_SPEED = 1.0
+local TURN_LEASE_MS = 7000
 
 local function nowMs()
     return math.floor(tick() * 1000)
+end
+
+local function findPlayerByName(name)
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Name == name then
+            return p
+        end
+    end
+    return nil
 end
 
 local function clearSpeakerByName(name)
     if not name or name == "" then
         return
     end
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p.Name == name then
-            p:SetAttribute("IsSpeaking", false)
-            break
-        end
+    local p = findPlayerByName(name)
+    if p then
+        p:SetAttribute("IsSpeaking", false)
+        p:SetAttribute("SpeechStreamId", "")
+        p:SetAttribute("SpeechLeaseId", "")
     end
     if gameState:GetAttribute("current_speaker") == name then
         gameState:SetAttribute("current_speaker", "")
@@ -146,40 +169,175 @@ local function clearSpeakerByName(name)
     end
 end
 
-local function hasActiveStreamForPlayer(name)
-    for _, streamState in pairs(activeSpeechStreams) do
-        if streamState and streamState.speaker == name then
-            return true
+local function queueSize()
+    return #pendingSpeechQueue
+end
+
+local function setQueueAttrs()
+    gameState:SetAttribute("pending_speakers", queueSize())
+end
+
+local function removeQueuedClaimForPlayer(name)
+    if not name or name == "" then
+        return nil
+    end
+    local streamId = pendingByPlayer[name]
+    pendingByPlayer[name] = nil
+    if not streamId then
+        setQueueAttrs()
+        return nil
+    end
+    for i = #pendingSpeechQueue, 1, -1 do
+        local entry = pendingSpeechQueue[i]
+        if entry and entry.player_name == name then table.remove(pendingSpeechQueue, i) end
+    end
+    setQueueAttrs()
+    return streamId
+end
+
+local function updateTurnAttrs()
+    if activeTurn then
+        gameState:SetAttribute("current_turn_stream_id", activeTurn.stream_id)
+        gameState:SetAttribute("current_turn_lease_id", activeTurn.lease_id)
+        gameState:SetAttribute("current_lease_expires_at_ms", activeTurn.lease_expires_at_ms or 0)
+    else
+        gameState:SetAttribute("current_turn_stream_id", "")
+        gameState:SetAttribute("current_turn_lease_id", "")
+        gameState:SetAttribute("current_lease_expires_at_ms", 0)
+    end
+end
+
+local function makeLeaseId(playerName, streamId)
+    return playerName .. "_" .. tostring(nowMs()) .. "_" .. tostring(math.random(1000, 9999)) .. "_" .. streamId
+end
+
+local function grantSpeech(player, streamId, fromQueue)
+    if not player or not streamId or streamId == "" then
+        return false, nil
+    end
+    if activeTurn ~= nil then
+        return false, nil
+    end
+
+    local leaseId = makeLeaseId(player.Name, streamId)
+    local now = nowMs()
+    activeTurn = {
+        player_name = player.Name,
+        stream_id = streamId,
+        lease_id = leaseId,
+        lease_expires_at_ms = now + TURN_LEASE_MS,
+        finalized = false,
+        release_at_ms = nil,
+        last_heartbeat_ms = now,
+        last_progress_seq = 0,
+        last_progress_at_ms = now,
+    }
+
+    gameState:SetAttribute("current_speaker", player.Name)
+    gameState:SetAttribute("speaker_claimed_at", tick())
+    gameState:SetAttribute("is_globally_silent", false)
+    gameState:SetAttribute("silence_ms", 0)
+    player:SetAttribute("IsSpeaking", true)
+    player:SetAttribute("SpeechStreamId", streamId)
+    player:SetAttribute("SpeechLeaseId", leaseId)
+    updateTurnAttrs()
+
+    speechBus:FireClient(player, {
+        op = "Granted",
+        speaker = player.Name,
+        stream_id = streamId,
+        lease_id = leaseId,
+        lease_expires_at_ms = activeTurn.lease_expires_at_ms,
+        from_queue = fromQueue == true,
+        at_ms = now,
+    })
+    speechBus:FireAllClients({
+        op = "Claimed",
+        speaker = player.Name,
+        stream_id = streamId,
+        lease_id = leaseId,
+        lease_expires_at_ms = activeTurn.lease_expires_at_ms,
+        from_queue = fromQueue == true,
+        at_ms = now,
+    })
+    return true, leaseId
+end
+
+local function grantNextQueuedSpeaker()
+    if activeTurn ~= nil then
+        return false
+    end
+    while #pendingSpeechQueue > 0 do
+        local entry = table.remove(pendingSpeechQueue, 1)
+        if entry and entry.player_name and pendingByPlayer[entry.player_name] == entry.stream_id then
+            local player = findPlayerByName(entry.player_name)
+            setQueueAttrs()
+            if player then
+                pendingByPlayer[entry.player_name] = nil
+                if grantSpeech(player, entry.stream_id, true) then
+                    return true
+                end
+            else
+                pendingByPlayer[entry.player_name] = nil
+            end
+        else
+            setQueueAttrs()
         end
     end
+    setQueueAttrs()
     return false
 end
 
-local function releaseStream(streamId, reason)
-    local streamState = activeSpeechStreams[streamId]
-    if not streamState then
+local function releaseActiveTurn(reason)
+    if not activeTurn then
         return false
     end
-    local speakerName = streamState.speaker
-    activeSpeechStreams[streamId] = nil
-
-    -- If this speaker still has another active stream (e.g. multiple <speak> tags),
-    -- keep the speaking lock until the final stream finishes.
-    if not hasActiveStreamForPlayer(speakerName) then
-        clearSpeakerByName(speakerName)
-    end
+    local turn = activeTurn
+    activeTurn = nil
+    clearSpeakerByName(turn.player_name)
+    updateTurnAttrs()
     local now = nowMs()
     gameState:SetAttribute("last_speech_at_ms", now)
     gameState:SetAttribute("silence_ms", 0)
     gameState:SetAttribute("is_globally_silent", false)
     speechBus:FireAllClients({
         op = "Released",
-        speaker = speakerName,
-        stream_id = streamId,
+        speaker = turn.player_name,
+        stream_id = turn.stream_id,
+        lease_id = turn.lease_id,
         reason = reason or "released",
         at_ms = now,
     })
     return true
+end
+
+local function enqueueClaim(player, streamId)
+    local existingStream = pendingByPlayer[player.Name]
+    if existingStream and existingStream ~= streamId then
+        removeQueuedClaimForPlayer(player.Name)
+    end
+    if pendingByPlayer[player.Name] == streamId then
+        speechBus:FireClient(player, {
+            op = "Queued",
+            stream_id = streamId,
+            position = queueSize(),
+            at_ms = nowMs(),
+        })
+        return
+    end
+    pendingByPlayer[player.Name] = streamId
+    table.insert(pendingSpeechQueue, {
+        player_name = player.Name,
+        stream_id = streamId,
+        requested_at_ms = nowMs(),
+    })
+    setQueueAttrs()
+    speechBus:FireClient(player, {
+        op = "Queued",
+        stream_id = streamId,
+        position = queueSize(),
+        at_ms = nowMs(),
+    })
 end
 
 local function parsePositiveNumber(value, fallback)
@@ -221,12 +379,33 @@ local function rejectSpeech(player, streamId, reason)
     })
 end
 
+local function validateActiveTurn(player, streamId, leaseId)
+    if not activeTurn then
+        rejectSpeech(player, streamId, "no_active_turn")
+        return nil
+    end
+    if activeTurn.player_name ~= player.Name then
+        rejectSpeech(player, streamId, "not_owner")
+        return nil
+    end
+    if activeTurn.stream_id ~= streamId then
+        rejectSpeech(player, streamId, "stream_mismatch")
+        return nil
+    end
+    if type(leaseId) ~= "string" or leaseId == "" or activeTurn.lease_id ~= leaseId then
+        rejectSpeech(player, streamId, "lease_mismatch")
+        return nil
+    end
+    return activeTurn
+end
+
 speechBus.OnServerEvent:Connect(function(player, payload)
     if type(payload) ~= "table" then
         return
     end
     local op = payload.op
     local streamId = payload.stream_id
+    local leaseId = payload.lease_id
     if type(op) ~= "string" then
         return
     end
@@ -236,44 +415,66 @@ speechBus.OnServerEvent:Connect(function(player, payload)
     end
 
     if op == "Claim" then
-        local speaker = gameState:GetAttribute("current_speaker")
-        if speaker ~= "" and speaker ~= nil and speaker ~= player.Name then
-            rejectSpeech(player, streamId, "speaker_locked")
+        if activeTurn and activeTurn.player_name == player.Name and activeTurn.stream_id == streamId then
+            speechBus:FireClient(player, {
+                op = "Granted",
+                speaker = player.Name,
+                stream_id = streamId,
+                lease_id = activeTurn.lease_id,
+                lease_expires_at_ms = activeTurn.lease_expires_at_ms,
+                from_queue = false,
+                at_ms = nowMs(),
+            })
             return
         end
-        gameState:SetAttribute("current_speaker", player.Name)
-        gameState:SetAttribute("speaker_claimed_at", tick())
-        gameState:SetAttribute("is_globally_silent", false)
-        gameState:SetAttribute("silence_ms", 0)
-        player:SetAttribute("IsSpeaking", true)
-        activeSpeechStreams[streamId] = {
-            speaker = player.Name,
-            release_at_ms = nil,
-        }
-        speechBus:FireAllClients({
-            op = "Claimed",
-            speaker = player.Name,
+        if activeTurn == nil then
+            removeQueuedClaimForPlayer(player.Name)
+            grantSpeech(player, streamId, false)
+            return
+        end
+        enqueueClaim(player, streamId)
+        return
+    end
+
+    if op == "Heartbeat" then
+        local turn = validateActiveTurn(player, streamId, leaseId)
+        if not turn then
+            return
+        end
+        local now = nowMs()
+        turn.lease_expires_at_ms = now + TURN_LEASE_MS
+        turn.last_heartbeat_ms = now
+        local progressSeq = parsePositiveNumber(payload.progress_seq, turn.last_progress_seq or 0)
+        if progressSeq > (turn.last_progress_seq or 0) then
+            turn.last_progress_seq = progressSeq
+            turn.last_progress_at_ms = now
+        end
+        updateTurnAttrs()
+        speechBus:FireClient(player, {
+            op = "HeartbeatAck",
             stream_id = streamId,
-            at_ms = nowMs(),
+            lease_id = turn.lease_id,
+            lease_expires_at_ms = turn.lease_expires_at_ms,
+            at_ms = now,
         })
         return
     end
 
-    local streamState = activeSpeechStreams[streamId]
-    if not streamState then
-        rejectSpeech(player, streamId, "unknown_stream")
-        return
-    end
-    if streamState.speaker ~= player.Name then
-        rejectSpeech(player, streamId, "not_owner")
-        return
-    end
-
     if op == "Finalize" then
+        local turn = validateActiveTurn(player, streamId, leaseId)
+        if not turn then
+            return
+        end
+        if turn.finalized then
+            return
+        end
         local durationMs = parsePlaybackDurationMs(payload)
-        local releaseAtMs = nowMs() + durationMs
-        streamState.release_at_ms = releaseAtMs
-        activeSpeechStreams[streamId] = streamState
+        local now = nowMs()
+        turn.finalized = true
+        turn.release_at_ms = now + durationMs
+        turn.lease_expires_at_ms = now + TURN_LEASE_MS
+        updateTurnAttrs()
+
         local speechText = ""
         if type(payload.speech_text) == "string" then
             speechText = payload.speech_text
@@ -283,18 +484,41 @@ speechBus.OnServerEvent:Connect(function(player, payload)
                 op = "SpeechText",
                 speaker = player.Name,
                 stream_id = streamId,
+                lease_id = turn.lease_id,
                 text = speechText,
-                at_ms = nowMs(),
+                at_ms = now,
             })
         end
         if durationMs <= 0 then
-            releaseStream(streamId, "natural_end")
+            if releaseActiveTurn("natural_end") then
+                grantNextQueuedSpeaker()
+                return
+            end
         end
         return
     end
 
     if op == "Cancel" then
-        releaseStream(streamId, "cancelled")
+        local removed = removeQueuedClaimForPlayer(player.Name)
+        if removed and removed == streamId then
+            speechBus:FireClient(player, {
+                op = "Cancelled",
+                stream_id = streamId,
+                at_ms = nowMs(),
+            })
+            return
+        end
+        if activeTurn and activeTurn.player_name == player.Name and activeTurn.stream_id == streamId then
+            if type(leaseId) == "string" and leaseId ~= "" and leaseId ~= activeTurn.lease_id then
+                rejectSpeech(player, streamId, "lease_mismatch")
+                return
+            end
+            releaseActiveTurn("cancelled")
+            grantNextQueuedSpeaker()
+            return
+        end
+        rejectSpeech(player, streamId, "unknown_stream")
+        return
     end
 end)
 
@@ -332,9 +556,17 @@ end)
 
 RunService.Heartbeat:Connect(function(dt)
     local now = nowMs()
-    for streamId, streamState in pairs(activeSpeechStreams) do
-        if streamState and streamState.release_at_ms and now >= streamState.release_at_ms then
-            releaseStream(streamId, "natural_end")
+    if activeTurn then
+        if activeTurn.finalized then
+            if activeTurn.release_at_ms and now >= activeTurn.release_at_ms then
+                releaseActiveTurn("natural_end")
+                grantNextQueuedSpeaker()
+            end
+        else
+            if now >= (activeTurn.lease_expires_at_ms or 0) then
+                releaseActiveTurn("lease_expired")
+                grantNextQueuedSpeaker()
+            end
         end
     end
 
@@ -356,14 +588,29 @@ RunService.Heartbeat:Connect(function(dt)
             gameState:SetAttribute("silence_epoch", epoch + 1)
         end
     end
+
+    if activeTurn == nil then
+        grantNextQueuedSpeaker()
+    end
 end)
+
+local function handlePlayerRemoving(player)
+    removeQueuedClaimForPlayer(player.Name)
+    if activeTurn and activeTurn.player_name == player.Name then
+        releaseActiveTurn("player_left")
+        grantNextQueuedSpeaker()
+    end
+    clearSpeakerByName(player.Name)
+    grantNextQueuedSpeaker()
+    cleanupPlayer(player)
+end
 
 --------------------------------------------------------------------------------
 -- INITIALIZATION
 --------------------------------------------------------------------------------
 
 Players.PlayerAdded:Connect(setupPlayer)
-Players.PlayerRemoving:Connect(cleanupPlayer)
+Players.PlayerRemoving:Connect(handlePlayerRemoving)
 
 for _, player in ipairs(Players:GetPlayers()) do
     setupPlayer(player)

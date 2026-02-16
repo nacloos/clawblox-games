@@ -188,7 +188,7 @@ class ElevenLabsMultiContextPlayer {
 		this.ws = null;
 		this.wsReady = false;
 		this.currentContextId = null;
-		this.contextStates = new Map(); // contextId -> { chunkCount, lastChunkTime, doneSent, resolve }
+			this.contextStates = new Map(); // contextId -> { chunkCount, lastChunkTime, doneSent, resolve, receivedFinal }
 		this.keepAliveTimer = null;
 		this.reconnectDelay = 1000;
 		// Streaming text state: accumulates LLM deltas, flushes at sentence boundaries
@@ -268,9 +268,10 @@ class ElevenLabsMultiContextPlayer {
 			}
 		}
 
-		if (data.isFinal || data.is_final) {
-			debugLog(`WS is_final ctx=${contextId} chunks=${ctxState?.chunkCount ?? "?"}`);
-			this._completeContext(contextId);
+			if (data.isFinal || data.is_final) {
+				if (ctxState) ctxState.receivedFinal = true;
+				debugLog(`WS is_final ctx=${contextId} chunks=${ctxState?.chunkCount ?? "?"}`);
+				this._completeContext(contextId);
 		}
 
 		if (data.error || data.message) {
@@ -336,7 +337,15 @@ class ElevenLabsMultiContextPlayer {
 			this._streamingCtx = contextId;
 			this._streamingBuffer = "";
 			this.currentContextId = contextId;
-			const ctxState = { chunkCount: 0, lastChunkTime: 0, doneSent: false, resolve: null, totalAudioBytes: 0, playbackStartTime: 0 };
+				const ctxState = {
+					chunkCount: 0,
+					lastChunkTime: 0,
+					doneSent: false,
+					resolve: null,
+					totalAudioBytes: 0,
+					playbackStartTime: 0,
+					receivedFinal: false,
+				};
 			this.contextStates.set(contextId, ctxState);
 			debugLog(`sendTextChunk: new ctx=${contextId}`);
 			// Send voice_settings on the first message
@@ -391,25 +400,8 @@ class ElevenLabsMultiContextPlayer {
 				playbackSpeed: this.speed,
 			};
 		}
-		const done = new Promise((resolve) => { ctxState.resolve = resolve; });
-
-		// Silence detector: 1.5s of no new chunks after first chunk = done
-		const silenceCheck = setInterval(() => {
-			if (ctxState.doneSent) { clearInterval(silenceCheck); return; }
-			if (ctxState.chunkCount > 0 && Date.now() - ctxState.lastChunkTime > 1500) {
-				debugLog(`flushStream ctx=${contextId} silence-done after ${ctxState.chunkCount} chunks`);
-				clearInterval(silenceCheck);
-				this._completeContext(contextId, speechText);
-			}
-		}, 200);
-
-		await Promise.race([done, sleep(15000)]);
-		clearInterval(silenceCheck);
-
-		if (!ctxState.doneSent) {
-			debugLog(`flushStream ctx=${contextId} timeout after ${ctxState.chunkCount} chunks`);
-			this._completeContext(contextId, speechText);
-		}
+			const done = new Promise((resolve) => { ctxState.resolve = resolve; });
+			await done;
 
 		const meta = {
 			totalAudioBytes: ctxState.totalAudioBytes || 0,
@@ -794,9 +786,12 @@ let speechStreamText = "";
 let ttsInsideSpeak = false; // true while accumulating text inside <speak>/<s> tag
 let ttsSpeakAccum = ""; // full text of current speak segment (for speech channel + logging)
 let ttsSpeakStreamId = null; // stream_id for SpeechBus claim of current speak segment
+let ttsSpeakLeaseId = null; // lease_id granted by server for current stream
 let ttsCanStream = false; // true only after SpeechBus claim confirmed
 let ttsPendingText = ""; // buffered speak text while claim is pending
 let ttsClaimPromise = null; // promise resolving to claim result for current stream
+let ttsHeartbeatTimer = null;
+let ttsHeartbeatSeq = 0;
 
 function startActionIdleTimer() {
 	stopActionIdleTimer();
@@ -875,9 +870,14 @@ function isSpeechTurnBlocked() {
 	return Boolean(speaker) && speaker !== worldAgentName;
 }
 
+function isSpeechPipelineBusy() {
+	return state.speechBusy || Boolean(ttsClaimPromise) || Boolean(ttsSpeakStreamId) || ttsInsideSpeak;
+}
+
 async function runSpeechPrompt(text, source = "unspecified") {
-	debugLog(`[speech] prompt requested source=${source} busy=${state.speechBusy} closing=${isClosing}`);
-	if (disableSpeechAgent || isClosing || state.speechBusy) return;
+	const pipelineBusy = isSpeechPipelineBusy();
+	debugLog(`[speech] prompt requested source=${source} busy=${pipelineBusy} closing=${isClosing}`);
+	if (disableSpeechAgent || isClosing || pipelineBusy) return;
 	if (isSpeechTurnBlocked()) {
 		debugLog(`[speech] prompt blocked source=${source} current_speaker=${getCurrentSpeakerFromObservation(lastObservation)}`);
 		return;
@@ -897,8 +897,9 @@ async function runSpeechPrompt(text, source = "unspecified") {
 }
 
 async function runSpeechContinue(source = "unspecified") {
-	debugLog(`[speech] continue requested source=${source} busy=${state.speechBusy} closing=${isClosing}`);
-	if (disableSpeechAgent || isClosing || state.speechBusy) return;
+	const pipelineBusy = isSpeechPipelineBusy();
+	debugLog(`[speech] continue requested source=${source} busy=${pipelineBusy} closing=${isClosing}`);
+	if (disableSpeechAgent || isClosing || pipelineBusy) return;
 	if (isSpeechTurnBlocked()) {
 		debugLog(`[speech] continue blocked source=${source} current_speaker=${getCurrentSpeakerFromObservation(lastObservation)}`);
 		return;
@@ -982,52 +983,75 @@ async function sendSpeechBus(op, payload = {}) {
 	});
 }
 
+function getSpeechLeaseFromObservation(observation, streamId) {
+	if (!observation) return { claimed: false, leaseId: null };
+	const attrs = observation?.player?.attributes || {};
+	const speaker = getCurrentSpeakerFromObservation(observation);
+	const claimedBySelf = attrs?.IsSpeaking === true || speaker === worldAgentName;
+	if (!claimedBySelf) return { claimed: false, leaseId: null };
+	const observedStreamId = String(attrs?.SpeechStreamId || "").trim();
+	const observedLeaseId = String(attrs?.SpeechLeaseId || "").trim();
+	if (!observedLeaseId) return { claimed: false, leaseId: null };
+	if (observedStreamId && observedStreamId !== streamId) return { claimed: false, leaseId: null };
+	return { claimed: true, leaseId: observedLeaseId };
+}
+
 async function sendSpeechClaim(streamId) {
 	const obs = await sendSpeechBus("Claim", { stream_id: streamId });
-	const isClaimedBySelf = (o) => {
-		if (!o) return false;
-		if (o?.player?.attributes?.IsSpeaking === true) return true;
-		const entities = Array.isArray(o?.world?.entities) ? o.world.entities : [];
-		for (const entity of entities) {
-			if (entity?.name !== "GameState") continue;
-			const speaker = String(entity?.attributes?.current_speaker || "");
-			if (speaker === worldAgentName) return true;
-		}
-		return false;
-	};
-
-	let claimed = isClaimedBySelf(obs);
+	let claim = getSpeechLeaseFromObservation(obs, streamId);
 	// Observation snapshots can lag by a tick; retry once before treating as rejected.
-	if (!claimed) {
+	if (!claim.claimed) {
 		try {
 			await sleep(80);
 			const retryObs = await fetchObserve();
-			claimed = isClaimedBySelf(retryObs);
+			claim = getSpeechLeaseFromObservation(retryObs, streamId);
 		} catch {}
 	}
-	if (!claimed) {
+	if (!claim.claimed) {
 		debugLog(`sendSpeechClaim: claim rejected for stream ${streamId}`);
 	}
-	return claimed;
+	return claim;
 }
 
-async function sendSpeechClaimWithRetry(streamId, { maxWaitMs = 6000, retryDelayMs = 180 } = {}) {
-	const deadline = Date.now() + maxWaitMs;
-	while (Date.now() < deadline) {
+async function sendSpeechClaimWithRetry(streamId, { retryDelayMs = SPEECH_CLAIM_RETRY_DELAY_MS } = {}) {
+	while (!isClosing) {
 		try {
-			const claimed = await sendSpeechClaim(streamId);
-			if (claimed) return true;
+			const claim = await sendSpeechClaim(streamId);
+			if (claim.claimed && claim.leaseId) return claim.leaseId;
 		} catch {}
 		await sleep(retryDelayMs);
 	}
-	debugLog(`sendSpeechClaimWithRetry: timed out for stream ${streamId}`);
-	return false;
+	debugLog(`sendSpeechClaimWithRetry: aborted due to shutdown for stream ${streamId}`);
+	return null;
 }
 
-async function sendSpeechFinalize(streamId, speechText, playbackMeta = {}) {
+async function sendSpeechHeartbeat(streamId, leaseId, progressSeq) {
+	try {
+		await sendSpeechBus("Heartbeat", {
+			stream_id: streamId,
+			lease_id: leaseId,
+			progress_seq: Number(progressSeq || 0),
+		});
+	} catch (err) {
+		debugLog(`sendSpeechHeartbeat error for ${streamId}: ${err instanceof Error ? err.message : String(err)}`);
+	}
+}
+
+async function sendSpeechCancel(streamId, leaseId = null) {
+	try {
+		const payload = { stream_id: streamId };
+		if (leaseId) payload.lease_id = leaseId;
+		await sendSpeechBus("Cancel", payload);
+	} catch (err) {
+		debugLog(`sendSpeechCancel error for ${streamId}: ${err instanceof Error ? err.message : String(err)}`);
+	}
+}
+
+async function sendSpeechFinalize(streamId, leaseId, speechText, playbackMeta = {}) {
 	try {
 		await sendSpeechBus("Finalize", {
 			stream_id: streamId,
+			lease_id: leaseId,
 			speech_text: speechText || "",
 			total_audio_bytes: Number(playbackMeta.totalAudioBytes || 0),
 			sample_rate_hz: Number(playbackMeta.sampleRateHz || AUDIO_SAMPLE_RATE_HZ),
@@ -1038,6 +1062,26 @@ async function sendSpeechFinalize(streamId, speechText, playbackMeta = {}) {
 	} catch (err) {
 		debugLog(`sendSpeechFinalize error for ${streamId}: ${err instanceof Error ? err.message : String(err)}`);
 	}
+}
+
+function stopSpeechHeartbeat() {
+	if (ttsHeartbeatTimer) {
+		clearInterval(ttsHeartbeatTimer);
+		ttsHeartbeatTimer = null;
+	}
+}
+
+function startSpeechHeartbeat(streamId, leaseId) {
+	stopSpeechHeartbeat();
+	ttsHeartbeatSeq = 0;
+	const send = () => {
+		if (!ttsSpeakStreamId || ttsSpeakStreamId !== streamId) return;
+		if (!ttsSpeakLeaseId || ttsSpeakLeaseId !== leaseId) return;
+		ttsHeartbeatSeq += 1;
+		void sendSpeechHeartbeat(streamId, leaseId, ttsHeartbeatSeq);
+	};
+	send();
+	ttsHeartbeatTimer = setInterval(send, 800);
 }
 
 async function executeActions(actions) {
@@ -1133,6 +1177,7 @@ const STALL_CUE_MS = Number(process.env.STALL_CUE_MS || "10000");
 const STALL_CUE_COOLDOWN_MS = Number(process.env.STALL_CUE_COOLDOWN_MS || "4000");
 const STALL_CUE_STARTUP_GRACE_MS = Number(process.env.STALL_CUE_STARTUP_GRACE_MS || "1500");
 const STALL_CUE_TEXT = process.env.STALL_CUE_TEXT || "[scene cue]: Everyone stays silent for a moment. The pause turns awkward.";
+const SPEECH_CLAIM_RETRY_DELAY_MS = Number(process.env.SPEECH_CLAIM_RETRY_DELAY_MS || "180");
 let lastConversationActivityAt = Date.now();
 let lastStallCueAt = 0;
 let stallCueTimer = null;
@@ -1203,7 +1248,7 @@ function flushDeferredSpeechEvents() {
 			timestamp: Date.now(),
 		});
 	}
-	if (!state.speechBusy) void runSpeechContinue("flushDeferredSpeechEvents");
+		if (!isSpeechPipelineBusy()) void runSpeechContinue("flushDeferredSpeechEvents");
 }
 
 function handleSpeechEvent(ev) {
@@ -1232,7 +1277,7 @@ function handleSpeechEvent(ev) {
 		content: [{ type: "text", text: `[${ev.speaker} says]: ${ev.text}` }],
 		timestamp: Date.now(),
 	});
-	if (!state.speechBusy) void runSpeechContinue(`heard:${ev.speaker}`);
+	if (!isSpeechPipelineBusy()) void runSpeechContinue(`heard:${ev.speaker}`);
 }
 
 function connectSpeechWs() {
@@ -1308,7 +1353,7 @@ function startObserveLoop() {
 			if (!obs) return;
 			injectObserveForSpeech(obs);
 			flushDeferredSpeechEvents();
-			if (!state.speechBusy && speechAgent.state.messages.length > 0) void runSpeechContinue("observeLoop");
+				if (!isSpeechPipelineBusy() && speechAgent.state.messages.length > 0) void runSpeechContinue("observeLoop");
 		} catch (error) {
 			addSpeechLine(`[observe] error: ${error instanceof Error ? error.message : String(error)}`);
 		}
@@ -1322,7 +1367,7 @@ function startStallCueLoop() {
 			logStallSkip(`disabled_or_closing disableSpeech=${disableSpeechAgent} closing=${isClosing}`);
 			return;
 		}
-		if (state.speechBusy) {
+		if (isSpeechPipelineBusy()) {
 			logStallSkip("speech_busy");
 			return;
 		}
@@ -1368,7 +1413,7 @@ function startStallCueLoop() {
 				content: [{ type: "text", text: STALL_CUE_TEXT }],
 				timestamp: Date.now(),
 			});
-			if (!state.speechBusy) void runSpeechContinue("stall_cue");
+				if (!isSpeechPipelineBusy()) void runSpeechContinue("stall_cue");
 		} catch (error) {
 			debugLog(`[stall] observe error: ${error instanceof Error ? error.message : String(error)}`);
 		} finally {
@@ -1385,14 +1430,16 @@ function stopStallCueLoop() {
 speechAgent.subscribe(async (event) => {
 	persistSpeechConversation();
 
-	if (event.type === "message_start" && event.message.role === "assistant") {
-		speechStreamText = "";
-		ttsInsideSpeak = false;
-		ttsSpeakAccum = "";
-		ttsSpeakStreamId = null;
-		ttsCanStream = false;
-		ttsPendingText = "";
-		ttsClaimPromise = null;
+		if (event.type === "message_start" && event.message.role === "assistant") {
+			stopSpeechHeartbeat();
+			speechStreamText = "";
+			ttsInsideSpeak = false;
+			ttsSpeakAccum = "";
+			ttsSpeakStreamId = null;
+			ttsSpeakLeaseId = null;
+			ttsCanStream = false;
+			ttsPendingText = "";
+			ttsClaimPromise = null;
 		previewLastSentAt = 0;
 		previewLastText = "";
 		state.speechLiveLine = "assistant>";
@@ -1426,35 +1473,39 @@ speechAgent.subscribe(async (event) => {
 						ttsSpeakAccum = "";
 						ttsPendingText = "";
 						ttsCanStream = false;
-						const streamId = `ctx_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-						ttsSpeakStreamId = streamId;
-						audioPlayer?.setNextContextId(streamId);
-						ttsClaimPromise = sendSpeechClaimWithRetry(streamId)
-							.then((claimed) => {
-								// Ignore stale claim results from old streams.
-								if (ttsSpeakStreamId !== streamId) return false;
-								ttsCanStream = claimed;
-								if (!claimed) {
-									debugLog(`Speech claim rejected for stream ${streamId}, dropping buffered audio`);
-									ttsPendingText = "";
-									audioPlayer?.interrupt();
-									return false;
-								}
-								if (ttsPendingText) {
-									audioPlayer?.sendTextChunk(ttsPendingText);
-									ttsPendingText = "";
-								}
-								return true;
-							})
-							.catch((err) => {
-								if (ttsSpeakStreamId === streamId) {
-									debugLog(`sendSpeechClaim error for ${streamId}: ${err instanceof Error ? err.message : String(err)}`);
-									ttsCanStream = false;
-									ttsPendingText = "";
-									audioPlayer?.interrupt();
-								}
-								return false;
-							});
+							const streamId = `ctx_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+							ttsSpeakStreamId = streamId;
+							audioPlayer?.setNextContextId(streamId);
+							ttsClaimPromise = sendSpeechClaimWithRetry(streamId)
+								.then((leaseId) => {
+									// Ignore stale claim results from old streams.
+									if (ttsSpeakStreamId !== streamId) return null;
+									ttsCanStream = Boolean(leaseId);
+									ttsSpeakLeaseId = leaseId || null;
+									if (!leaseId) {
+										debugLog(`Speech claim rejected for stream ${streamId}, dropping buffered audio`);
+										ttsPendingText = "";
+										audioPlayer?.interrupt();
+										return null;
+									}
+									startSpeechHeartbeat(streamId, leaseId);
+									if (ttsPendingText) {
+										audioPlayer?.sendTextChunk(ttsPendingText);
+										ttsPendingText = "";
+									}
+									return leaseId;
+								})
+								.catch((err) => {
+									if (ttsSpeakStreamId === streamId) {
+										debugLog(`sendSpeechClaim error for ${streamId}: ${err instanceof Error ? err.message : String(err)}`);
+										ttsCanStream = false;
+										ttsSpeakLeaseId = null;
+										ttsPendingText = "";
+										stopSpeechHeartbeat();
+										audioPlayer?.interrupt();
+									}
+									return null;
+								});
 					} else if (ttsSpeakAccum.length > 0 && !ttsSpeakAccum.endsWith("\n\n")) {
 						// Add a small pause between speak-tag segments while keeping one stream.
 						if (ttsCanStream) audioPlayer?.sendTextChunk("\n\n");
@@ -1497,20 +1548,21 @@ speechAgent.subscribe(async (event) => {
 		if (err) addSpeechLine(`[error] ${err}`);
 
 			// Flush any remaining text if LLM ended mid-speak or with buffered speak stream.
-			if (ttsSpeakStreamId) {
-				const streamId = ttsSpeakStreamId;
-				let claimed = ttsCanStream;
-				if (ttsClaimPromise) {
-					try {
-						claimed = await ttsClaimPromise;
-					} catch {
-						claimed = false;
+				if (ttsSpeakStreamId) {
+					const streamId = ttsSpeakStreamId;
+					let leaseId = ttsSpeakLeaseId;
+					if (ttsClaimPromise) {
+						try {
+							leaseId = await ttsClaimPromise;
+						} catch {
+							leaseId = null;
+						}
 					}
-				}
+					const claimed = Boolean(leaseId);
 
-				if (ttsInsideSpeak && speechStreamText.trim()) {
-					if (claimed) audioPlayer?.sendTextChunk(speechStreamText);
-					else ttsPendingText += speechStreamText;
+					if (ttsInsideSpeak && speechStreamText.trim()) {
+						if (claimed) audioPlayer?.sendTextChunk(speechStreamText);
+						else ttsPendingText += speechStreamText;
 					ttsSpeakAccum += speechStreamText;
 				}
 
@@ -1519,11 +1571,13 @@ speechAgent.subscribe(async (event) => {
 					ttsPendingText = "";
 				}
 
-				if (claimed) {
-					const spokenText = ttsSpeakAccum;
-					let playbackMeta = {
-						totalAudioBytes: 0,
-						sampleRateHz: AUDIO_SAMPLE_RATE_HZ,
+					if (claimed) {
+						// After text streaming is complete, lease extension stops; server lease expiry handles stalled finalization.
+						stopSpeechHeartbeat();
+						const spokenText = ttsSpeakAccum;
+						let playbackMeta = {
+							totalAudioBytes: 0,
+							sampleRateHz: AUDIO_SAMPLE_RATE_HZ,
 						channels: AUDIO_CHANNELS,
 						bytesPerSample: AUDIO_BYTES_PER_SAMPLE,
 						playbackSpeed: 1.0,
@@ -1535,23 +1589,26 @@ speechAgent.subscribe(async (event) => {
 							playbackMeta = await audioPlayer.flushStream() || playbackMeta;
 						}
 					}
-					if (spokenText.trim()) {
-						markConversationActivity("self_spoke");
-						addSpeechLine(`[speak] ${spokenText.slice(0, 80)}`);
-						if (claimed) maybePostSpeechPreview(spokenText, true);
+						if (spokenText.trim()) {
+							markConversationActivity("self_spoke");
+							addSpeechLine(`[speak] ${spokenText.slice(0, 80)}`);
+							if (claimed) maybePostSpeechPreview(spokenText, true);
+						}
+						await sendSpeechFinalize(streamId, leaseId, spokenText, playbackMeta);
+					} else {
+						await sendSpeechCancel(streamId, leaseId || null);
+						debugLog(`message_end: skipping TTS flush for unclaimed stream ${streamId}`);
 					}
-					await sendSpeechFinalize(streamId, spokenText, playbackMeta);
-				} else {
-					debugLog(`message_end: skipping TTS flush for unclaimed stream ${streamId}`);
 				}
-			}
-		speechStreamText = "";
-		ttsInsideSpeak = false;
-		ttsSpeakAccum = "";
-		ttsSpeakStreamId = null;
-		ttsCanStream = false;
-		ttsPendingText = "";
-		ttsClaimPromise = null;
+			speechStreamText = "";
+			ttsInsideSpeak = false;
+			ttsSpeakAccum = "";
+			ttsSpeakStreamId = null;
+			ttsSpeakLeaseId = null;
+			ttsCanStream = false;
+			ttsPendingText = "";
+			ttsClaimPromise = null;
+			stopSpeechHeartbeat();
 
 			const actions = extractActions(fullText);
 			if (actions.length > 0) void executeActions(actions);
@@ -1610,6 +1667,10 @@ async function shutdown(reason = "signal") {
 	stopStallCueLoop();
 	stopSpeechWsLoop();
 	stopActionIdleTimer();
+	stopSpeechHeartbeat();
+	if (ttsSpeakStreamId) {
+		void sendSpeechCancel(ttsSpeakStreamId, ttsSpeakLeaseId || null);
+	}
 	try {
 		audioPlayer?.interrupt();
 	} catch {}

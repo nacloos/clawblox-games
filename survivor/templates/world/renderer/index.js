@@ -79,6 +79,7 @@ const CHARACTERS = {
 }
 
 const CHAR_ORDER = ['host', 'rodger_dodger', 'yasmin', 'guy', 'stephanie', 'tommy']
+const UI_PREVIEW_PREFIX = '[[ui_preview]] '
 
 // ── Embedded CSS ────────────────────────────────────────
 const STYLES = `
@@ -361,6 +362,7 @@ export function createRenderer(ctx) {
   let currentSpeaker = null   // agent name of current speaker
   let previousSpeaker = null  // agent name of previous speaker
   let hasSpeechStarted = false
+  let previewSpeaker = null
 
   // ── Helpers ──
   function charData(agentName) {
@@ -516,7 +518,9 @@ export function createRenderer(ctx) {
   }
 
   // ── Speech display ──
-  function showSpeech(speaker, text) {
+  function showSpeech(speaker, text, options = {}) {
+    const preview = options.preview === true
+    const instant = options.instant === true
     if (titleVisible) {
       titleVisible = false
       $title.classList.add('hidden')
@@ -534,6 +538,15 @@ export function createRenderer(ctx) {
     const cd = charData(speaker)
     $speaker.textContent = cd.name
     $speaker.style.color = cd.color
+
+    if (preview || instant) {
+      if (typewriterTimer) {
+        clearInterval(typewriterTimer)
+        typewriterTimer = null
+      }
+      $text.textContent = text
+      return
+    }
 
     // Typewriter
     if (typewriterTimer) clearInterval(typewriterTimer)
@@ -558,7 +571,17 @@ export function createRenderer(ctx) {
     onState(state) {
       // Speech events arrive as {type: "speech", speaker, text, seq}
       if (state.type === 'speech') {
-        showSpeech(state.speaker, state.text)
+        const rawText = typeof state.text === 'string' ? state.text : ''
+        const isPreview = rawText.startsWith(UI_PREVIEW_PREFIX)
+        const text = isPreview ? rawText.slice(UI_PREVIEW_PREFIX.length) : rawText
+        if (isPreview) {
+          previewSpeaker = state.speaker
+          showSpeech(state.speaker, text, { preview: true })
+        } else {
+          const instant = previewSpeaker === state.speaker
+          previewSpeaker = null
+          showSpeech(state.speaker, text, { instant })
+        }
         return
       }
 

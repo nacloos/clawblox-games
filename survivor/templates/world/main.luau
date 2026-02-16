@@ -29,6 +29,7 @@ gameState:SetAttribute("phase", "voting")
 gameState:SetAttribute("votes_received", 0)
 gameState:SetAttribute("total_voters", 0)
 gameState:SetAttribute("result", "")
+gameState:SetAttribute("can_reveal_votes", false)
 gameState:SetAttribute("current_speaker", "")
 gameState:SetAttribute("speaker_claimed_at", 0)
 gameState.Parent = Workspace
@@ -68,6 +69,7 @@ local function tallyVotes()
     gameState:SetAttribute("result",
         "eliminated:" .. maxName .. "|" .. table.concat(parts, ","))
     gameState:SetAttribute("phase", "result")
+    gameState:SetAttribute("can_reveal_votes", false)
 end
 
 --------------------------------------------------------------------------------
@@ -157,10 +159,22 @@ AgentInputService.InputReceived:Connect(function(player, inputType, inputData)
         local received = gameState:GetAttribute("votes_received") + 1
         gameState:SetAttribute("votes_received", received)
         if received >= gameState:GetAttribute("total_voters") then
-            tallyVotes()
+            -- Host decides when to reveal. Keep votes private until RevealVotes.
+            gameState:SetAttribute("can_reveal_votes", true)
+            gameState:SetAttribute("phase", "awaiting_reveal")
         end
     elseif inputType == "UseIdol" and inputData and inputData.target then
         idolPlays[player.Name] = inputData.target
+    elseif inputType == "RevealVotes" then
+        if player.Name ~= "host" then
+            warn("[RevealVotes] Rejected: only host can reveal votes")
+            return
+        end
+        if gameState:GetAttribute("votes_received") < gameState:GetAttribute("total_voters") then
+            warn("[RevealVotes] Rejected: not all votes are in yet")
+            return
+        end
+        tallyVotes()
     elseif inputType == "PlaySpeech" then
         if not inputData or not inputData.stream_id then
             warn("[PlaySpeech] Missing stream_id from " .. player.Name)
@@ -202,22 +216,7 @@ end)
 --------------------------------------------------------------------------------
 
 RunService.Heartbeat:Connect(function(dt)
-    -- Auto-release speaking lock after 15s (safety valve for crashed agents)
-    local speaker = gameState:GetAttribute("current_speaker")
-    if speaker and speaker ~= "" then
-        local claimedAt = gameState:GetAttribute("speaker_claimed_at")
-        if claimedAt > 0 and tick() - claimedAt > 15 then
-            warn("[Heartbeat] Force-releasing speaking lock for " .. speaker .. " after 15s timeout")
-            -- Clean up any active streams for this speaker
-            for streamId, streamSpeaker in pairs(activeSpeechStreams) do
-                if streamSpeaker == speaker then
-                    releaseStream(streamId)
-                end
-            end
-            -- Defensive clear in case stream map and speaker lock drift out of sync.
-            clearSpeakerByName(speaker)
-        end
-    end
+    -- Speaking lock is released only by explicit SpeechFinished/AudioEnded events.
 end)
 
 --------------------------------------------------------------------------------

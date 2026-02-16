@@ -123,13 +123,19 @@ function extractActivities(text) {
 	return out;
 }
 
-function extractIntents(text) {
+function extractActions(text) {
 	const out = [];
-	const re = /<intent>([\s\S]*?)<\/intent>/g;
+	const re = /<action>([\s\S]*?)<\/action>/g;
 	let m;
 	while ((m = re.exec(text)) !== null) {
-		const intent = m[1].trim();
-		if (intent) out.push(intent);
+		const raw = m[1].trim();
+		if (!raw) continue;
+		try {
+			const action = JSON.parse(raw);
+			if (action && typeof action.type === "string") out.push(action);
+		} catch {
+			// Ignore malformed action blocks; keep streaming behavior resilient.
+		}
 	}
 	return out;
 }
@@ -455,9 +461,10 @@ function loadCodexAccessToken(scriptDir) {
 	return undefined;
 }
 
-let debugLogPath; // set after gameDir is resolved
+let debugLogPath; // set after gameDir/agentName is resolved
+let debugLogPrefix = "";
 function debugLog(msg) {
-	if (debugLogPath) appendFileSync(debugLogPath, `[${new Date().toISOString()}] ${msg}\n`);
+	if (debugLogPath) appendFileSync(debugLogPath, `[${new Date().toISOString()}]${debugLogPrefix} ${msg}\n`);
 }
 
 function now() {
@@ -495,10 +502,13 @@ const cliDir = argv.find((a) => a.startsWith("--dir="))?.split("=")[1]
 const scriptPath = new URL(import.meta.url).pathname;
 const scriptDir = path.dirname(scriptPath);
 const gameDir = cliDir ? path.resolve(cliDir) : scriptDir;
-debugLogPath = path.join(gameDir, "debug.log");
-writeFileSync(debugLogPath, ""); // clear on start
 const scriptName = path.basename(scriptPath, path.extname(scriptPath));
 const agentName = cliNameArg || process.env.WORLD_AGENT_NAME || scriptName;
+const logsDir = path.join(gameDir, "logs");
+mkdirSync(logsDir, { recursive: true });
+debugLogPath = process.env.DEBUG_LOG_PATH || path.join(logsDir, `${agentName}.debug.log`);
+debugLogPrefix = ` [agent=${agentName} pid=${process.pid}]`;
+writeFileSync(debugLogPath, ""); // clear this agent's debug log on start
 const resultsDir = path.join(gameDir, "results", agentName);
 mkdirSync(resultsDir, { recursive: true });
 
@@ -645,13 +655,11 @@ const speechSystemPrompt = [
 	// "Max 1-2 sentences in speak tags.",
 	"Keep it short and concise when speaking (max 1 sentence) unless the situation really calls for it.",
 	"",
-	"You will receive act_in_world tool results describing actions and observations in the world",
-	"React to them if you are not already talking to someone.",
-	"Don't mention low level details like coordinates, this is fucking boring.",
-	"If you are still working and need more time ('still working' tool calls), you are great at filling in the blanks and keeping it entertaining as hell. Unhinged and hilarious are your strengths.",
-	// "you observe in the world. React only if something is worth reacting to.",
-	"You can express intent using <intent>...</intent> to guide your actions in the world (max 1 sentence). Don't use it too often.",
-	"Do not try to call act_in_world yourself, it is provided automatically.",
+		"You receive speech from other players and can react naturally.",
+		"Don't mention low level details like coordinates, this is fucking boring.",
+		"To take a world action, output a JSON payload inside <action>...</action> tags.",
+		"Use one action object per <action> tag, with {\"type\":\"...\",\"data\":{...}} format.",
+		"Only use action types and data shapes defined by the current game's skill.md.",
 	"",
 	"If you are struggling or you're just too dumb to do something, keep it entertaining and fun haha. Be a bit silly and crazy, even edgy and unhinged.",
 	"",
@@ -705,7 +713,7 @@ const actionAgent = new Agent({
 });
 actionAgent.setSteeringMode("all");
 
-const disableActionAgent = cliFlags.has("--no-action");
+const disableActionAgent = true;
 const disableSpeechAgent = cliFlags.has("--no-speech");
 
 const state = {
@@ -728,11 +736,13 @@ let lastActionActivityAt = 0;
 let actionIdleTimer = null;
 const ACTION_IDLE_MS = 2000;
 // const ACTION_IDLE_MS = 10000;
-let speechIntentBuffer = [];
 let speechStreamText = "";
 let ttsInsideSpeak = false; // true while accumulating text inside <speak>/<s> tag
 let ttsSpeakAccum = ""; // full text of current speak segment (for speech channel + logging)
 let ttsSpeakStreamId = null; // stream_id for PlaySpeech claim of current speak segment
+let ttsCanStream = false; // true only after PlaySpeech claim confirmed
+let ttsPendingText = ""; // buffered speak text while claim is pending
+let ttsClaimPromise = null; // promise resolving to claim result for current stream
 
 function startActionIdleTimer() {
 	stopActionIdleTimer();
@@ -796,8 +806,27 @@ function persistActionConversation() {
 	writeFileSync(actionConversationPath, JSON.stringify(actionAgent.state.messages, null, 2));
 }
 
+function getCurrentSpeakerFromObservation(observation) {
+	const entities = Array.isArray(observation?.world?.entities) ? observation.world.entities : [];
+	for (const entity of entities) {
+		if (entity?.name !== "GameState") continue;
+		const speaker = String(entity?.attributes?.current_speaker || "").trim();
+		return speaker;
+	}
+	return "";
+}
+
+function isSpeechTurnBlocked() {
+	const speaker = getCurrentSpeakerFromObservation(lastObservation);
+	return Boolean(speaker) && speaker !== worldAgentName;
+}
+
 async function runSpeechPrompt(text) {
 	if (disableSpeechAgent || isClosing || state.speechBusy) return;
+	if (isSpeechTurnBlocked()) {
+		debugLog(`runSpeechPrompt blocked: current_speaker=${getCurrentSpeakerFromObservation(lastObservation)}`);
+		return;
+	}
 	state.speechBusy = true;
 	requestRender();
 	try {
@@ -812,6 +841,10 @@ async function runSpeechPrompt(text) {
 
 async function runSpeechContinue() {
 	if (disableSpeechAgent || isClosing || state.speechBusy) return;
+	if (isSpeechTurnBlocked()) {
+		debugLog(`runSpeechContinue blocked: current_speaker=${getCurrentSpeakerFromObservation(lastObservation)}`);
+		return;
+	}
 	state.speechBusy = true;
 	requestRender();
 	try {
@@ -872,34 +905,56 @@ async function fetchObserve() {
 	});
 }
 
-async function postSpeechToServer(text) {
-	if (!worldSession) return;
-	const cleaned = String(text || "").trim();
-	if (!cleaned) return;
-	try {
-		await fetch(`${worldBaseUrl}/speech`, {
-			method: "POST",
-			headers: { "X-Session": worldSession, "Content-Type": "application/json" },
-			body: JSON.stringify({ text: cleaned }),
-		});
-	} catch (err) {
-		debugLog(`[speech] post error: ${err instanceof Error ? err.message : String(err)}`);
-	}
-}
-
-async function sendPlaySpeech(streamId) {
+async function sendWorldInput(inputType, data = {}) {
 	const res = await fetch(`${worldBaseUrl}/input`, {
 		method: "POST",
 		headers: { "X-Session": worldSession, "Content-Type": "application/json" },
-		body: JSON.stringify({ type: "PlaySpeech", data: { stream_id: streamId } }),
+		body: JSON.stringify({ type: inputType, data }),
 	});
-	if (!res.ok) throw new Error(`PlaySpeech failed: ${res.status} ${res.statusText}`);
-	const obs = await res.json();
-	const claimed = obs?.player?.attributes?.IsSpeaking === true;
+	if (!res.ok) throw new Error(`${inputType} failed: ${res.status} ${res.statusText}`);
+	return await res.json();
+}
+
+async function sendPlaySpeech(streamId) {
+	const obs = await sendWorldInput("PlaySpeech", { stream_id: streamId });
+	const isClaimedBySelf = (o) => {
+		if (!o) return false;
+		if (o?.player?.attributes?.IsSpeaking === true) return true;
+		const entities = Array.isArray(o?.world?.entities) ? o.world.entities : [];
+		for (const entity of entities) {
+			if (entity?.name !== "GameState") continue;
+			const speaker = String(entity?.attributes?.current_speaker || "");
+			if (speaker === worldAgentName) return true;
+		}
+		return false;
+	};
+
+	let claimed = isClaimedBySelf(obs);
+	// Observation snapshots can lag by a tick; retry once before treating as rejected.
+	if (!claimed) {
+		try {
+			await sleep(80);
+			const retryObs = await fetchObserve();
+			claimed = isClaimedBySelf(retryObs);
+		} catch {}
+	}
 	if (!claimed) {
 		debugLog(`sendPlaySpeech: claim rejected for stream ${streamId}`);
 	}
 	return claimed;
+}
+
+async function executeActions(actions) {
+	for (const action of actions) {
+		const actionType = action?.type;
+		if (!actionType || actionType === "PlaySpeech") continue;
+		try {
+			await sendWorldInput(actionType, action?.data ?? {});
+			addSpeechLine(`[action] ${actionType}`);
+		} catch (error) {
+			addSpeechLine(`[action error] ${actionType}: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
 }
 
 function injectObserveForSpeech(observation) {
@@ -970,20 +1025,14 @@ function injectActionForSpeech(activities) {
 	}
 }
 
-function injectSpeechForAction(intents) {
-	for (const intent of intents) {
-		actionAgent.steer({
-			role: "user",
-			content: [{ type: "text", text: intent }],
-			timestamp: Date.now(),
-		});
-	}
-}
-
 let speechWs = null;
 let speechWsActive = false;
 let speechWsReconnectTimer = null;
 let speechLastSeq = 0;
+const pendingSpeechEvents = [];
+const UI_PREVIEW_PREFIX = "[[ui_preview]] ";
+let previewLastSentAt = 0;
+let previewLastText = "";
 
 function scheduleSpeechWsReconnect() {
 	if (!speechWsActive || isClosing || speechWsReconnectTimer) return;
@@ -991,6 +1040,49 @@ function scheduleSpeechWsReconnect() {
 		speechWsReconnectTimer = null;
 		connectSpeechWs();
 	}, 1000);
+}
+
+async function postSpeechToServer(text, { preview = false } = {}) {
+	if (!worldSession) return;
+	const cleaned = String(text || "").trim();
+	if (!cleaned) return;
+	const payloadText = preview ? `${UI_PREVIEW_PREFIX}${cleaned}` : cleaned;
+	try {
+		await fetch(`${worldBaseUrl}/speech`, {
+			method: "POST",
+			headers: { "X-Session": worldSession, "Content-Type": "application/json" },
+			body: JSON.stringify({ text: payloadText }),
+		});
+	} catch (err) {
+		debugLog(`[speech] post error: ${err instanceof Error ? err.message : String(err)}`);
+	}
+}
+
+function maybePostSpeechPreview(text, force = false) {
+	const cleaned = String(text || "").trim();
+	if (!cleaned) return;
+	const nowMs = Date.now();
+	if (!force && nowMs - previewLastSentAt < 120) return;
+	if (!force && cleaned === previewLastText) return;
+	previewLastSentAt = nowMs;
+	previewLastText = cleaned;
+	void postSpeechToServer(cleaned, { preview: true });
+}
+
+function flushDeferredSpeechEvents() {
+	if (pendingSpeechEvents.length === 0) return;
+	const currentSpeaker = getCurrentSpeakerFromObservation(lastObservation);
+	if (currentSpeaker && currentSpeaker !== worldAgentName) return;
+	while (pendingSpeechEvents.length > 0) {
+		const ev = pendingSpeechEvents.shift();
+		addSpeechLine(`[heard] ${ev.speaker}: ${ev.text}`);
+		speechAgent.steer({
+			role: "user",
+			content: [{ type: "text", text: `[${ev.speaker} says]: ${ev.text}` }],
+			timestamp: Date.now(),
+		});
+	}
+	if (!state.speechBusy) void runSpeechContinue();
 }
 
 function handleSpeechEvent(ev) {
@@ -1001,6 +1093,13 @@ function handleSpeechEvent(ev) {
 		speechLastSeq = seq;
 	}
 	if (ev.speaker === worldAgentName) return;
+	if (typeof ev.text === "string" && ev.text.startsWith(UI_PREVIEW_PREFIX)) return;
+	const currentSpeaker = getCurrentSpeakerFromObservation(lastObservation);
+	if (currentSpeaker && currentSpeaker === ev.speaker) {
+		pendingSpeechEvents.push(ev);
+		debugLog(`defer heard speech seq=${ev.seq} speaker=${ev.speaker} until speaker lock clears`);
+		return;
+	}
 	addSpeechLine(`[heard] ${ev.speaker}: ${ev.text}`);
 	speechAgent.steer({
 		role: "user",
@@ -1076,6 +1175,7 @@ function startObserveLoop() {
 			const obs = await fetchObserve();
 			if (!obs) return;
 			injectObserveForSpeech(obs);
+			flushDeferredSpeechEvents();
 			if (!state.speechBusy && speechAgent.state.messages.length > 0) void runSpeechContinue();
 		} catch (error) {
 			addSpeechLine(`[observe] error: ${error instanceof Error ? error.message : String(error)}`);
@@ -1083,7 +1183,7 @@ function startObserveLoop() {
 	}, Math.max(250, observeIntervalMs));
 }
 
-speechAgent.subscribe((event) => {
+speechAgent.subscribe(async (event) => {
 	persistSpeechConversation();
 
 	if (event.type === "message_start" && event.message.role === "assistant") {
@@ -1091,6 +1191,11 @@ speechAgent.subscribe((event) => {
 		ttsInsideSpeak = false;
 		ttsSpeakAccum = "";
 		ttsSpeakStreamId = null;
+		ttsCanStream = false;
+		ttsPendingText = "";
+		ttsClaimPromise = null;
+		previewLastSentAt = 0;
+		previewLastText = "";
 		state.speechLiveLine = "assistant>";
 		requestRender();
 		return;
@@ -1120,42 +1225,72 @@ speechAgent.subscribe((event) => {
 					// to avoid overlapping playback between segments.
 					if (!ttsSpeakStreamId) {
 						ttsSpeakAccum = "";
-						ttsSpeakStreamId = `ctx_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-						audioPlayer?.setNextContextId(ttsSpeakStreamId);
-						sendPlaySpeech(ttsSpeakStreamId).then(claimed => {
-							if (!claimed) {
-								debugLog(`Speech claim rejected for stream ${ttsSpeakStreamId}, interrupting audio`);
-								audioPlayer?.interrupt();
-							}
-						});
+						ttsPendingText = "";
+						ttsCanStream = false;
+						const streamId = `ctx_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+						ttsSpeakStreamId = streamId;
+						audioPlayer?.setNextContextId(streamId);
+						ttsClaimPromise = sendPlaySpeech(streamId)
+							.then((claimed) => {
+								// Ignore stale claim results from old streams.
+								if (ttsSpeakStreamId !== streamId) return false;
+								ttsCanStream = claimed;
+								if (!claimed) {
+									debugLog(`Speech claim rejected for stream ${streamId}, dropping buffered audio`);
+									ttsPendingText = "";
+									audioPlayer?.interrupt();
+									return false;
+								}
+								if (ttsPendingText) {
+									audioPlayer?.sendTextChunk(ttsPendingText);
+									ttsPendingText = "";
+								}
+								return true;
+							})
+							.catch((err) => {
+								if (ttsSpeakStreamId === streamId) {
+									debugLog(`sendPlaySpeech error for ${streamId}: ${err instanceof Error ? err.message : String(err)}`);
+									ttsCanStream = false;
+									ttsPendingText = "";
+									audioPlayer?.interrupt();
+								}
+								return false;
+							});
 					} else if (ttsSpeakAccum.length > 0 && !ttsSpeakAccum.endsWith("\n\n")) {
 						// Add a small pause between speak-tag segments while keeping one stream.
-						audioPlayer?.sendTextChunk("\n\n");
+						if (ttsCanStream) audioPlayer?.sendTextChunk("\n\n");
+						else ttsPendingText += "\n\n";
 						ttsSpeakAccum += "\n\n";
 					}
 				}
 				// We're inside a speak tag — look for closing tag
 				const closeMatch = speechStreamText.match(/<\/(?:speak|s)>/);
-				if (closeMatch) {
-					const inner = speechStreamText.slice(0, closeMatch.index);
-					if (inner) audioPlayer?.sendTextChunk(inner);
-					ttsSpeakAccum += inner;
-					speechStreamText = speechStreamText.slice(closeMatch.index + closeMatch[0].length);
-					ttsInsideSpeak = false;
-				} else {
-					// No closing tag yet — send what we have so far as incremental text
-					if (speechStreamText.length > 0) {
-						audioPlayer?.sendTextChunk(speechStreamText);
-					ttsSpeakAccum += speechStreamText;
+					if (closeMatch) {
+						const inner = speechStreamText.slice(0, closeMatch.index);
+						if (inner) {
+							if (ttsCanStream) audioPlayer?.sendTextChunk(inner);
+							else ttsPendingText += inner;
+						}
+						ttsSpeakAccum += inner;
+						maybePostSpeechPreview(ttsSpeakAccum);
+						speechStreamText = speechStreamText.slice(closeMatch.index + closeMatch[0].length);
+						ttsInsideSpeak = false;
+					} else {
+						// No closing tag yet — send what we have so far as incremental text
+						if (speechStreamText.length > 0) {
+							if (ttsCanStream) audioPlayer?.sendTextChunk(speechStreamText);
+							else ttsPendingText += speechStreamText;
+							ttsSpeakAccum += speechStreamText;
+							maybePostSpeechPreview(ttsSpeakAccum);
+						}
+						speechStreamText = "";
+						break;
+					}
 				}
-				speechStreamText = "";
-				break;
-			}
-		}
 
-		requestRender();
-		return;
-	}
+			requestRender();
+			return;
+		}
 		if (event.type === "message_end" && event.message.role === "assistant") {
 		const fullText = event.message.content.filter((c) => c.type === "text").map((c) => c.text).join("");
 		if (fullText.trim().length > 0) addSpeechLine(`assistant> ${fullText}`);
@@ -1164,41 +1299,57 @@ speechAgent.subscribe((event) => {
 
 			// Flush any remaining text if LLM ended mid-speak or with buffered speak stream.
 			if (ttsSpeakStreamId) {
+				const streamId = ttsSpeakStreamId;
+				let claimed = ttsCanStream;
+				if (ttsClaimPromise) {
+					try {
+						claimed = await ttsClaimPromise;
+					} catch {
+						claimed = false;
+					}
+				}
+
 				if (ttsInsideSpeak && speechStreamText.trim()) {
-					audioPlayer?.sendTextChunk(speechStreamText);
+					if (claimed) audioPlayer?.sendTextChunk(speechStreamText);
+					else ttsPendingText += speechStreamText;
 					ttsSpeakAccum += speechStreamText;
 				}
-				const spokenText = ttsSpeakAccum;
-				if (spokenText.trim()) {
-					addSpeechLine(`[speak] ${spokenText.slice(0, 80)}`);
-					// Publish text immediately for renderer/agent visibility.
-					// audio_done remains the signal for turn release.
-					void postSpeechToServer(spokenText);
-					audioPlayer?.flushStream();
+
+				if (claimed && ttsPendingText) {
+					audioPlayer?.sendTextChunk(ttsPendingText);
+					ttsPendingText = "";
+				}
+
+				if (claimed) {
+					const spokenText = ttsSpeakAccum;
+					if (spokenText.trim()) {
+						addSpeechLine(`[speak] ${spokenText.slice(0, 80)}`);
+						maybePostSpeechPreview(spokenText, true);
+						// Publish speech text with done chunk; server emits speech event on playback completion.
+						await audioPlayer?.flushStream({ speechText: spokenText });
+					} else {
+						await audioPlayer?.flushStream();
+					}
 				} else {
-					audioPlayer?.flushStream();
+					debugLog(`message_end: skipping TTS flush for unclaimed stream ${streamId}`);
 				}
 			}
 		speechStreamText = "";
 		ttsInsideSpeak = false;
 		ttsSpeakAccum = "";
 		ttsSpeakStreamId = null;
+		ttsCanStream = false;
+		ttsPendingText = "";
+		ttsClaimPromise = null;
 
-		const intents = extractIntents(fullText);
-		if (intents.length > 0) speechIntentBuffer.push(...intents);
+			const actions = extractActions(fullText);
+			if (actions.length > 0) void executeActions(actions);
 
 		state.speechLiveLine = "";
 		state.speechPinnedUser = "";
 		requestRender();
 	}
-	if (event.type === "turn_end") {
-		if (speechIntentBuffer.length > 0) {
-			const intents = speechIntentBuffer.splice(0);
-			injectSpeechForAction(intents);
-			if (!state.actionBusy) void runActionContinue();
-		}
-	}
-});
+	});
 
 actionAgent.subscribe((event) => {
 	persistActionConversation();

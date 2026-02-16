@@ -460,6 +460,32 @@ speechBus.OnServerEvent:Connect(function(player, payload)
         return
     end
 
+    if op == "Progress" then
+        local turn = validateActiveTurn(player, streamId, leaseId)
+        if not turn then
+            return
+        end
+        local now = nowMs()
+        turn.lease_expires_at_ms = now + TURN_LEASE_MS
+        turn.last_heartbeat_ms = now
+
+        local progressSeq = parsePositiveNumber(payload.progress_seq, turn.last_progress_seq or 0)
+        if progressSeq > (turn.last_progress_seq or 0) then
+            turn.last_progress_seq = progressSeq
+            turn.last_progress_at_ms = now
+        end
+        updateTurnAttrs()
+        speechBus:FireClient(player, {
+            op = "ProgressAck",
+            stream_id = streamId,
+            lease_id = turn.lease_id,
+            progress_seq = turn.last_progress_seq or 0,
+            lease_expires_at_ms = turn.lease_expires_at_ms,
+            at_ms = now,
+        })
+        return
+    end
+
     if op == "Finalize" then
         local turn = validateActiveTurn(player, streamId, leaseId)
         if not turn then

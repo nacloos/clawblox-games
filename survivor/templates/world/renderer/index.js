@@ -79,7 +79,6 @@ const CHARACTERS = {
 }
 
 const CHAR_ORDER = ['host', 'rodger_dodger', 'yasmin', 'guy', 'stephanie', 'tommy']
-const UI_PREVIEW_PREFIX = '[[ui_preview]] '
 const DEBUG_SPEECH_SYNC = true
 const MUSIC_PHASE_TRACK = {
   voting: 'normal',
@@ -368,9 +367,11 @@ export function createRenderer(ctx) {
   let currentSpeaker = null   // agent name of current speaker
   let previousSpeaker = null  // agent name of previous speaker
   let hasSpeechStarted = false
-  let previewSpeaker = null
+  let progressSpeaker = null
   let lastRenderSignature = ''
   let gamePhase = 'voting'
+  let votesReceived = 0
+  let totalVoters = 0
 
   // ── Background music (phase-based) ──
   const MUSIC_VOL = 0.4
@@ -564,8 +565,6 @@ export function createRenderer(ctx) {
 
   // ── Render characters ──
   function renderCharacters() {
-    $chars.innerHTML = ''
-
     if (!hasSpeechStarted) {
       // Before any speech: show all characters spread out (initial council view)
       const playerMap = new Map()
@@ -579,6 +578,13 @@ export function createRenderer(ctx) {
         if (!CHAR_ORDER.includes(p.name)) ordered.push(p)
       }
 
+      const lock = lockedSpeakerFromPlayers(players)
+      const sig = `pre|all=${ordered.map((p) => p.name).join(',')}|voted=${ordered.map((p) => (playerHasVoted(p) ? '1' : '0')).join('')}`
+      if (sig === lastRenderSignature) {
+        return
+      }
+
+      $chars.innerHTML = ''
       const total = ordered.length
       ordered.forEach((p, i) => {
         const isSpeaking = p.attributes?.IsSpeaking === true
@@ -588,12 +594,8 @@ export function createRenderer(ctx) {
         $chars.appendChild(el)
         requestAnimationFrame(() => el.classList.add('visible'))
       })
-      const lock = lockedSpeakerFromPlayers(players)
-      const sig = `pre|lock=${lock}|all=${ordered.map((p) => p.name).join(',')}`
-      if (sig !== lastRenderSignature) {
-        dbg(`render pre-speech ${sig}`)
-        lastRenderSignature = sig
-      }
+      dbg(`render pre-speech pre|lock=${lock}|all=${ordered.map((p) => p.name).join(',')}`)
+      lastRenderSignature = sig
       return
     }
 
@@ -608,6 +610,16 @@ export function createRenderer(ctx) {
     const playerMap = new Map()
     for (const p of players) playerMap.set(p.name, p)
 
+    const lock = lockedSpeakerFromPlayers(players)
+    const sig = `post|current=${currentSpeaker || ''}|prev=${previousSpeaker || ''}|show=${toShow.map((e) => e.name).join(',')}|voted=${toShow.map((entry) => {
+      const p = playerMap.get(entry.name)
+      return p && playerHasVoted(p) ? '1' : '0'
+    }).join('')}`
+    if (sig === lastRenderSignature) {
+      return
+    }
+
+    $chars.innerHTML = ''
     toShow.forEach((entry, i) => {
       const p = playerMap.get(entry.name)
       const hasVoted = p ? playerHasVoted(p) : false
@@ -616,30 +628,34 @@ export function createRenderer(ctx) {
       $chars.appendChild(el)
       requestAnimationFrame(() => el.classList.add('visible'))
     })
-    const lock = lockedSpeakerFromPlayers(players)
-    const sig = `post|lock=${lock}|current=${currentSpeaker || ''}|prev=${previousSpeaker || ''}|show=${toShow.map((e) => e.name).join(',')}`
-    if (sig !== lastRenderSignature) {
-      dbg(`render post-speech ${sig}`)
-      lastRenderSignature = sig
-    }
+    dbg(`render post-speech post|lock=${lock}|current=${currentSpeaker || ''}|prev=${previousSpeaker || ''}|show=${toShow.map((e) => e.name).join(',')}`)
+    lastRenderSignature = sig
   }
 
   // ── Vote HUD ──
   function updateVoteHud() {
-    const total = players.length
+    let total = totalVoters
+    let voted = votesReceived
+
+    // Fallback for older frames that don't include GameState vote counters.
+    if (typeof total !== 'number' || total <= 0) {
+      const nonHost = players.filter((p) => p.name !== 'host')
+      total = nonHost.length
+      voted = nonHost.filter((p) => playerHasVoted(p)).length
+    }
+
     if (total === 0) {
       $hudLabel.textContent = ''
       $hudFill.style.width = '0%'
       return
     }
-    const voted = players.filter(p => playerHasVoted(p)).length
     $hudLabel.textContent = `Votes: ${voted} / ${total}`
     $hudFill.style.width = `${Math.round((voted / total) * 100)}%`
   }
 
   // ── Speech display ──
   function showSpeech(speaker, text, options = {}) {
-    const preview = options.preview === true
+    const progress = options.progress === true
     const instant = options.instant === true
     if (titleVisible) {
       titleVisible = false
@@ -651,7 +667,7 @@ export function createRenderer(ctx) {
     // Track speaker transitions
     if (speaker !== currentSpeaker) {
       const lock = lockedSpeakerFromPlayers(players)
-      dbg(`showSpeech switch speaker=${speaker} preview=${preview} instant=${instant} oldCurrent=${currentSpeaker || ''} oldPrev=${previousSpeaker || ''} lock=${lock || '(none)'}`)
+      dbg(`showSpeech switch speaker=${speaker} progress=${progress} instant=${instant} oldCurrent=${currentSpeaker || ''} oldPrev=${previousSpeaker || ''} lock=${lock || '(none)'}`)
       previousSpeaker = currentSpeaker
       currentSpeaker = speaker
       renderCharacters()
@@ -661,14 +677,14 @@ export function createRenderer(ctx) {
     $speaker.textContent = cd.name
     $speaker.style.color = cd.color
 
-    if (preview || instant) {
+    if (progress || instant) {
       if (typewriterTimer) {
         clearInterval(typewriterTimer)
         typewriterTimer = null
       }
       $text.textContent = text
       const lock = lockedSpeakerFromPlayers(players)
-      dbg(`showSpeech apply speaker=${speaker} mode=${preview ? 'preview' : 'instant'} textLen=${text.length} lock=${lock || '(none)'}`)
+      dbg(`showSpeech apply speaker=${speaker} mode=${progress ? 'progress' : 'instant'} textLen=${text.length} lock=${lock || '(none)'}`)
       return
     }
 
@@ -706,34 +722,59 @@ export function createRenderer(ctx) {
     return null
   }
 
+  function extractGameStateAttributes(state) {
+    if (!state || !Array.isArray(state.entities)) return null
+    for (const entity of state.entities) {
+      if (!entity || entity.name !== 'GameState') continue
+      return entity.attributes || {}
+    }
+    return null
+  }
+
   // ── Renderer lifecycle ──
   return {
     onState(state) {
+      const gameStateAttrs = extractGameStateAttributes(state)
+      if (gameStateAttrs) {
+        if (typeof gameStateAttrs.votes_received === 'number') {
+          votesReceived = gameStateAttrs.votes_received
+        }
+        if (typeof gameStateAttrs.total_voters === 'number') {
+          totalVoters = gameStateAttrs.total_voters
+        }
+      }
+
       const nextPhase = extractGamePhase(state)
       if (nextPhase && nextPhase !== gamePhase) {
         gamePhase = nextPhase
         switchMusic(getTrackForPhase(gamePhase))
       }
 
-      // Speech events arrive as {type: "speech", speaker, text, seq}
-      if (state.type === 'speech') {
-        const rawText = typeof state.text === 'string' ? state.text : ''
-        const isPreview = rawText.startsWith(UI_PREVIEW_PREFIX)
-        const text = isPreview ? rawText.slice(UI_PREVIEW_PREFIX.length) : rawText
+      if (state.type === 'speech_progress') {
+        const text = typeof state.text === 'string' ? state.text : ''
         const lock = lockedSpeakerFromPlayers(players)
         const seq = state.seq ?? '?'
-        dbg(`speech event seq=${seq} speaker=${state.speaker} kind=${isPreview ? 'preview' : 'final'} textLen=${text.length} lock=${lock || '(none)'} current=${currentSpeaker || ''} previewSpeaker=${previewSpeaker || ''}`)
+        dbg(`speech progress seq=${seq} speaker=${state.speaker} textLen=${text.length} lock=${lock || '(none)'} current=${currentSpeaker || ''} progressSpeaker=${progressSpeaker || ''}`)
         if (lock && lock !== state.speaker) {
-          dbg(`WARNING speaker/lock mismatch at speech event: eventSpeaker=${state.speaker} lock=${lock}`)
+          dbg(`WARNING speaker/lock mismatch at speech progress: speaker=${state.speaker} lock=${lock}`)
         }
-        if (isPreview) {
-          previewSpeaker = state.speaker
-          showSpeech(state.speaker, text, { preview: true })
-        } else {
-          const instant = previewSpeaker === state.speaker
-          previewSpeaker = null
-          showSpeech(state.speaker, text, { instant })
+        progressSpeaker = state.speaker
+        showSpeech(state.speaker, text, { progress: true })
+        return
+      }
+
+      // Committed speech event: authoritative turn output.
+      if (state.type === 'speech') {
+        const text = typeof state.text === 'string' ? state.text : ''
+        const lock = lockedSpeakerFromPlayers(players)
+        const seq = state.seq ?? '?'
+        dbg(`speech final seq=${seq} speaker=${state.speaker} textLen=${text.length} lock=${lock || '(none)'} current=${currentSpeaker || ''} progressSpeaker=${progressSpeaker || ''}`)
+        if (lock && lock !== state.speaker) {
+          dbg(`WARNING speaker/lock mismatch at speech final: speaker=${state.speaker} lock=${lock}`)
         }
+        const instant = progressSpeaker === state.speaker
+        progressSpeaker = null
+        showSpeech(state.speaker, text, { instant })
         return
       }
 

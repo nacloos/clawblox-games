@@ -542,11 +542,11 @@ async function fetchJson(url, init = {}) {
 	return await res.json();
 }
 
-function buildSpectateWsUrl(baseUrl) {
+function buildSpectateWsUrl(baseUrl, role = "spectator") {
 	const url = new URL(baseUrl);
 	url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
 	url.pathname = "/spectate/ws";
-	url.search = "";
+	url.search = `role=${encodeURIComponent(role)}`;
 	url.hash = "";
 	return url.toString();
 }
@@ -815,6 +815,9 @@ let ttsPendingText = ""; // buffered speak text while claim is pending
 let ttsClaimPromise = null; // promise resolving to claim result for current stream
 let ttsHeartbeatTimer = null;
 let ttsHeartbeatSeq = 0;
+let ttsProgressSeq = 0;
+let ttsLastProgressSentText = "";
+let ttsLastProgressSentAt = 0;
 
 function startActionIdleTimer() {
 	stopActionIdleTimer();
@@ -1064,6 +1067,19 @@ async function sendSpeechHeartbeat(streamId, leaseId, progressSeq) {
 	}
 }
 
+async function sendSpeechProgress(streamId, leaseId, progressSeq, text) {
+	try {
+		await sendSpeechBus("Progress", {
+			stream_id: streamId,
+			lease_id: leaseId,
+			progress_seq: Number(progressSeq || 0),
+			text: String(text || ""),
+		});
+	} catch (err) {
+		debugLog(`sendSpeechProgress error for ${streamId}: ${err instanceof Error ? err.message : String(err)}`);
+	}
+}
+
 async function sendSpeechCancel(streamId, leaseId = null) {
 	try {
 		const payload = { stream_id: streamId };
@@ -1110,6 +1126,23 @@ function startSpeechHeartbeat(streamId, leaseId) {
 	};
 	send();
 	ttsHeartbeatTimer = setInterval(send, 800);
+}
+
+function maybeSendSpeechProgress(force = false) {
+	if (!ttsCanStream || !ttsSpeakStreamId || !ttsSpeakLeaseId) return;
+	const text = String(ttsSpeakAccum || "");
+	if (!text.trim()) return;
+	const nowMs = Date.now();
+	if (!force && text === ttsLastProgressSentText && nowMs - ttsLastProgressSentAt < SPEECH_PROGRESS_MIN_INTERVAL_MS) {
+		return;
+	}
+	if (!force && nowMs - ttsLastProgressSentAt < SPEECH_PROGRESS_MIN_INTERVAL_MS) {
+		return;
+	}
+	ttsProgressSeq += 1;
+	ttsLastProgressSentText = text;
+	ttsLastProgressSentAt = nowMs;
+	void sendSpeechProgress(ttsSpeakStreamId, ttsSpeakLeaseId, ttsProgressSeq, text);
 }
 
 async function executeActions(actions) {
@@ -1205,6 +1238,7 @@ const STALL_CUE_COOLDOWN_MS = Number(process.env.STALL_CUE_COOLDOWN_MS || "4000"
 const STALL_CUE_STARTUP_GRACE_MS = Number(process.env.STALL_CUE_STARTUP_GRACE_MS || "1500");
 const STALL_CUE_TEXT = process.env.STALL_CUE_TEXT || "[scene cue]: Everyone stays silent for a moment. The pause turns awkward.";
 const SPEECH_CLAIM_RETRY_DELAY_MS = Number(process.env.SPEECH_CLAIM_RETRY_DELAY_MS || "180");
+const SPEECH_PROGRESS_MIN_INTERVAL_MS = Number(process.env.SPEECH_PROGRESS_MIN_INTERVAL_MS || "120");
 let lastConversationActivityAt = Date.now();
 let lastStallCueAt = 0;
 let stallCueTimer = null;
@@ -1301,7 +1335,7 @@ async function waitForSelfPlaybackDone(streamId) {
 
 function connectSpeechWs() {
 	if (!speechWsActive || isClosing || !worldSession) return;
-	const wsUrl = buildSpectateWsUrl(worldBaseUrl);
+	const wsUrl = buildSpectateWsUrl(worldBaseUrl, "actor");
 	const ws = new WebSocketClient(wsUrl, { headers: { "X-Session": worldSession } });
 	speechWs = ws;
 
@@ -1462,6 +1496,9 @@ speechAgent.subscribe(async (event) => {
 			ttsCanStream = false;
 			ttsPendingText = "";
 			ttsClaimPromise = null;
+			ttsProgressSeq = 0;
+			ttsLastProgressSentText = "";
+			ttsLastProgressSentAt = 0;
 		state.speechLiveLine = "assistant>";
 		requestRender();
 		return;
@@ -1513,6 +1550,7 @@ speechAgent.subscribe(async (event) => {
 										audioPlayer?.sendTextChunk(ttsPendingText);
 										ttsPendingText = "";
 									}
+									maybeSendSpeechProgress();
 									return leaseId;
 								})
 								.catch((err) => {
@@ -1531,6 +1569,7 @@ speechAgent.subscribe(async (event) => {
 						if (ttsCanStream) audioPlayer?.sendTextChunk("\n\n");
 						else ttsPendingText += "\n\n";
 						ttsSpeakAccum += "\n\n";
+						maybeSendSpeechProgress();
 					}
 				}
 				// We're inside a speak tag — look for closing tag
@@ -1542,6 +1581,7 @@ speechAgent.subscribe(async (event) => {
 							else ttsPendingText += inner;
 						}
 						ttsSpeakAccum += inner;
+						maybeSendSpeechProgress();
 						speechStreamText = speechStreamText.slice(closeMatch.index + closeMatch[0].length);
 						ttsInsideSpeak = false;
 					} else {
@@ -1550,6 +1590,7 @@ speechAgent.subscribe(async (event) => {
 							if (ttsCanStream) audioPlayer?.sendTextChunk(speechStreamText);
 							else ttsPendingText += speechStreamText;
 							ttsSpeakAccum += speechStreamText;
+							maybeSendSpeechProgress();
 						}
 						speechStreamText = "";
 						break;
@@ -1582,6 +1623,7 @@ speechAgent.subscribe(async (event) => {
 						if (claimed) audioPlayer?.sendTextChunk(speechStreamText);
 						else ttsPendingText += speechStreamText;
 					ttsSpeakAccum += speechStreamText;
+					maybeSendSpeechProgress();
 				}
 
 				if (claimed && ttsPendingText) {
@@ -1591,6 +1633,7 @@ speechAgent.subscribe(async (event) => {
 
 					if (claimed) {
 						const spokenText = ttsSpeakAccum;
+						maybeSendSpeechProgress(true);
 						let playbackMeta = {
 							totalAudioBytes: 0,
 							sampleRateHz: AUDIO_SAMPLE_RATE_HZ,
@@ -1628,6 +1671,9 @@ speechAgent.subscribe(async (event) => {
 			ttsCanStream = false;
 			ttsPendingText = "";
 			ttsClaimPromise = null;
+			ttsProgressSeq = 0;
+			ttsLastProgressSentText = "";
+			ttsLastProgressSentAt = 0;
 			stopSpeechHeartbeat();
 
 			const actions = extractActions(fullText);

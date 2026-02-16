@@ -1071,18 +1071,8 @@ async function sendSpeechClaimWithRetry(
 ) {
 	while (!isClosing) {
 		if (typeof shouldAbort === "function" && shouldAbort()) {
-			// Before aborting as stale, check whether server already granted this stream.
-			// This avoids dropping a just-granted lease during lock handoff races.
-			try {
-				const obs = await fetchObserve();
-				const claim = getSpeechLeaseFromObservation(obs, streamId);
-				if (claim.claimed && claim.leaseId) {
-					debugLog(`sendSpeechClaimWithRetry: recovered granted lease for stale stream ${streamId}`);
-					return claim.leaseId;
-				}
-			} catch (err) {
-				debugLog(`sendSpeechClaimWithRetry stale-check observe error for ${streamId}: ${err instanceof Error ? err.message : String(err)}`);
-			}
+			// Strict stale handling: always cancel and abort stale streams.
+			await sendSpeechCancel(streamId, null);
 			debugLog(`sendSpeechClaimWithRetry: abort stale stream ${streamId}`);
 			return null;
 		}
@@ -1655,22 +1645,6 @@ speechAgent.subscribe(async (event) => {
 							leaseId = null;
 						}
 					}
-					// Recover late grants that may have landed during epoch/claim races.
-					if (!leaseId) {
-						try {
-							const obs = await fetchObserve();
-							const claim = getSpeechLeaseFromObservation(obs, streamId);
-							if (claim.claimed && claim.leaseId) {
-								leaseId = claim.leaseId;
-								ttsCanStream = true;
-								ttsSpeakLeaseId = leaseId;
-								startSpeechHeartbeat(streamId, leaseId);
-								debugLog(`message_end: recovered late lease stream=${streamId}`);
-							}
-						} catch (err) {
-							debugLog(`message_end lease recovery error for ${streamId}: ${err instanceof Error ? err.message : String(err)}`);
-						}
-					}
 					const claimed = Boolean(leaseId);
 
 					if (ttsInsideSpeak && speechStreamText.trim()) {
@@ -1712,7 +1686,7 @@ speechAgent.subscribe(async (event) => {
 						await sendSpeechFinalize(streamId, leaseId, spokenText, playbackMeta);
 						stopSpeechHeartbeat();
 					} else {
-						if (leaseId) await sendSpeechCancel(streamId, leaseId);
+						await sendSpeechCancel(streamId, leaseId || null);
 						debugLog(`message_end: skipping TTS flush for unclaimed stream ${streamId}`);
 						stopSpeechHeartbeat();
 					}

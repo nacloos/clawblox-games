@@ -37,7 +37,7 @@ gameState:SetAttribute("last_speech_at_ms", 0)
 gameState:SetAttribute("silence_ms", 0)
 gameState:SetAttribute("is_globally_silent", false)
 gameState:SetAttribute("silence_epoch", 0)
-gameState:SetAttribute("silence_threshold_ms", 8000)
+gameState:SetAttribute("silence_threshold_ms", 2000)
 gameState:SetAttribute("pending_speakers", 0)
 gameState:SetAttribute("current_turn_stream_id", "")
 gameState:SetAttribute("current_turn_lease_id", "")
@@ -132,7 +132,7 @@ speechBus.Parent = ReplicatedStorage
 
 local activeTurn = nil          -- { player_name, stream_id, lease_id, lease_expires_at_ms, finalized, release_at_ms, last_heartbeat_ms, last_progress_seq, last_progress_at_ms }
 local pendingByPlayer = {}      -- player_name -> { stream_id = string, requested_at_ms = number }
-local SILENCE_THRESHOLD_MS = 8000
+local SILENCE_THRESHOLD_MS = 2000
 local DEFAULT_SAMPLE_RATE_HZ = 24000
 local DEFAULT_CHANNELS = 1
 local DEFAULT_BYTES_PER_SAMPLE = 2

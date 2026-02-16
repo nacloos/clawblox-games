@@ -194,6 +194,8 @@ class ElevenLabsMultiContextPlayer {
 		// Streaming text state: accumulates LLM deltas, flushes at sentence boundaries
 		this._streamingCtx = null; // contextId for current streaming session
 		this._streamingBuffer = ""; // unflushed text
+		// Per-stream upload chains enforce strict chunk ordering (including done=true).
+		this._uploadChains = new Map(); // streamId -> Promise
 	}
 
 	async start() {
@@ -262,7 +264,7 @@ class ElevenLabsMultiContextPlayer {
 				ctxState.totalAudioBytes += base64DecodedLen(data.audio);
 				if (!ctxState.playbackStartTime) ctxState.playbackStartTime = Date.now();
 				debugLog(`WS chunk #${ctxState.chunkCount} ctx=${contextId} audioLen=${data.audio.length}`);
-				void this._sendChunk(contextId, ctxState.chunkCount - 1, data.audio, false);
+				void this._queueSendChunk(contextId, ctxState.chunkCount - 1, data.audio, false);
 			} else {
 				debugLog(`WS chunk for unknown/done ctx=${contextId}, ignoring`);
 			}
@@ -299,9 +301,11 @@ class ElevenLabsMultiContextPlayer {
 			? speechText
 			: (typeof ctxState.finalSpeechText === "string" ? ctxState.finalSpeechText : "");
 		ctxState.doneSent = true;
-		void this._sendChunk(contextId, ctxState.chunkCount, "", true, finalSpeechText);
-		if (ctxState.resolve) ctxState.resolve();
-		if (this.currentContextId === contextId) this.currentContextId = null;
+		void this._queueSendChunk(contextId, ctxState.chunkCount, "", true, finalSpeechText)
+			.finally(() => {
+				if (ctxState.resolve) ctxState.resolve();
+				if (this.currentContextId === contextId) this.currentContextId = null;
+			});
 	}
 
 	_startKeepAlive() {
@@ -459,29 +463,45 @@ class ElevenLabsMultiContextPlayer {
 		this.currentContextId = null;
 	}
 
-	async _sendChunk(streamId, seq, data, done, speechText) {
-		try {
-			const body = {
-				stream_id: streamId,
-				seq,
-				data,
-				done,
-				sample_rate_hz: AUDIO_SAMPLE_RATE_HZ,
-				channels: AUDIO_CHANNELS,
-				bytes_per_sample: AUDIO_BYTES_PER_SAMPLE,
-				playback_speed: this.speed,
-			};
-			if (done && speechText) body.speech_text = speechText;
-			await fetch(this.audioUrl, {
-				method: "POST",
-				headers: {
-					"X-Session": this.sessionToken,
-					"Content-Type": "application/json",
-				},
-				body: JSON.stringify(body),
+	_queueSendChunk(streamId, seq, data, done, speechText) {
+		const prev = this._uploadChains.get(streamId) || Promise.resolve();
+		const next = prev
+			.catch(() => {})
+			.then(() => this._sendChunk(streamId, seq, data, done, speechText))
+			.catch((err) => {
+				debugLog(`sendChunk error stream=${streamId} seq=${seq} done=${done}: ${err instanceof Error ? err.message : String(err)}`);
 			});
-		} catch (err) {
-			debugLog(`sendChunk error: ${err instanceof Error ? err.message : String(err)}`);
+		this._uploadChains.set(streamId, next);
+		next.finally(() => {
+			if (this._uploadChains.get(streamId) === next) {
+				this._uploadChains.delete(streamId);
+			}
+		});
+		return next;
+	}
+
+	async _sendChunk(streamId, seq, data, done, speechText) {
+		const body = {
+			stream_id: streamId,
+			seq,
+			data,
+			done,
+			sample_rate_hz: AUDIO_SAMPLE_RATE_HZ,
+			channels: AUDIO_CHANNELS,
+			bytes_per_sample: AUDIO_BYTES_PER_SAMPLE,
+			playback_speed: this.speed,
+		};
+		if (done && speechText) body.speech_text = speechText;
+		const res = await fetch(this.audioUrl, {
+			method: "POST",
+			headers: {
+				"X-Session": this.sessionToken,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify(body),
+		});
+		if (!res.ok) {
+			throw new Error(`HTTP ${res.status} ${res.statusText}`);
 		}
 	}
 
@@ -814,6 +834,7 @@ let ttsHeartbeatSeq = 0;
 let ttsProgressSeq = 0;
 let ttsLastProgressSentText = "";
 let ttsLastProgressSentAt = 0;
+let speechEventEpoch = 0; // increments on each heard-other speech event
 
 function startActionIdleTimer() {
 	stopActionIdleTimer();
@@ -1044,8 +1065,27 @@ async function sendSpeechClaim(streamId) {
 	return claim;
 }
 
-async function sendSpeechClaimWithRetry(streamId, { retryDelayMs = SPEECH_CLAIM_RETRY_DELAY_MS } = {}) {
+async function sendSpeechClaimWithRetry(
+	streamId,
+	{ retryDelayMs = SPEECH_CLAIM_RETRY_DELAY_MS, shouldAbort = null } = {},
+) {
 	while (!isClosing) {
+		if (typeof shouldAbort === "function" && shouldAbort()) {
+			// Before aborting as stale, check whether server already granted this stream.
+			// This avoids dropping a just-granted lease during lock handoff races.
+			try {
+				const obs = await fetchObserve();
+				const claim = getSpeechLeaseFromObservation(obs, streamId);
+				if (claim.claimed && claim.leaseId) {
+					debugLog(`sendSpeechClaimWithRetry: recovered granted lease for stale stream ${streamId}`);
+					return claim.leaseId;
+				}
+			} catch (err) {
+				debugLog(`sendSpeechClaimWithRetry stale-check observe error for ${streamId}: ${err instanceof Error ? err.message : String(err)}`);
+			}
+			debugLog(`sendSpeechClaimWithRetry: abort stale stream ${streamId}`);
+			return null;
+		}
 		try {
 			const claim = await sendSpeechClaim(streamId);
 			if (claim.claimed && claim.leaseId) return claim.leaseId;
@@ -1153,7 +1193,8 @@ function cancelPendingSpeechStream(reason = "unknown") {
 	debugLog(`[speech] cancel pending stream=${streamId} lease=${leaseId || "(none)"} reason=${reason}`);
 	resetTtsSpeechState();
 	audioPlayer?.interrupt();
-	void sendSpeechCancel(streamId, leaseId);
+	if (leaseId) void sendSpeechCancel(streamId, leaseId);
+	else debugLog(`[speech] cancel skipped stream=${streamId} reason=no_lease`);
 }
 
 function maybeSendSpeechProgress(force = false) {
@@ -1222,6 +1263,7 @@ const completedPlaybackStreams = new Map(); // stream_id -> playback_done payloa
 const pendingSpeechEvents = [];
 const STALL_CUE_TEXT = process.env.STALL_CUE_TEXT || "[scene cue]: Everyone stays silent for a moment. The pause turns awkward.";
 const SERVER_SILENCE_REPEAT_MS = Number(process.env.SERVER_SILENCE_REPEAT_MS || "2000");
+const ENABLE_SERVER_SILENCE_CUE = process.env.ENABLE_SERVER_SILENCE_CUE === "1";
 const SPEECH_CLAIM_RETRY_DELAY_MS = Number(process.env.SPEECH_CLAIM_RETRY_DELAY_MS || "180");
 const SPEECH_PROGRESS_MIN_INTERVAL_MS = Number(process.env.SPEECH_PROGRESS_MIN_INTERVAL_MS || "120");
 let lastConversationActivityAt = Date.now();
@@ -1282,10 +1324,11 @@ function handleSpeechEvent(ev) {
 		// Self timing is anchored strictly to explicit playback_done WS events.
 		return;
 	}
-	if (ttsSpeakStreamId) {
-		// Another speaker committed speech while our stream is pending/queued.
-		// Drop it to avoid stale responses being granted later.
-		cancelPendingSpeechStream(`heard_other:${ev.speaker}`);
+	speechEventEpoch += 1;
+	if (ttsSpeakStreamId && ttsSpeakLeaseId) {
+		// We already hold a lease for a turn and someone else committed speech.
+		// Cancel current turn to avoid speaking over newer context.
+		cancelPendingSpeechStream(`heard_other_claimed:${ev.speaker}`);
 	}
 	markConversationActivity(`heard:${ev.speaker}`);
 	// Process heard speech immediately. Deferring on speaker lock caused stalls when
@@ -1386,6 +1429,10 @@ function stopSpeechWsLoop() {
 
 
 function startStallCueLoop() {
+	if (!ENABLE_SERVER_SILENCE_CUE) {
+		debugLog("[stall] server silence cue disabled");
+		return;
+	}
 	stopStallCueLoop();
 	stallCueTimer = setInterval(async () => {
 		if (isClosing || disableSpeechAgent) {
@@ -1516,9 +1563,15 @@ speechAgent.subscribe(async (event) => {
 						ttsPendingText = "";
 						ttsCanStream = false;
 							const streamId = `ctx_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+							const streamStartEpoch = speechEventEpoch;
 							ttsSpeakStreamId = streamId;
 							audioPlayer?.setNextContextId(streamId);
-							ttsClaimPromise = sendSpeechClaimWithRetry(streamId)
+							ttsClaimPromise = sendSpeechClaimWithRetry(streamId, {
+								shouldAbort: () => (
+									ttsSpeakStreamId !== streamId
+									|| streamStartEpoch < speechEventEpoch
+								),
+							})
 								.then((leaseId) => {
 									// Ignore stale claim results from old streams.
 									if (ttsSpeakStreamId !== streamId) return null;
@@ -1602,6 +1655,22 @@ speechAgent.subscribe(async (event) => {
 							leaseId = null;
 						}
 					}
+					// Recover late grants that may have landed during epoch/claim races.
+					if (!leaseId) {
+						try {
+							const obs = await fetchObserve();
+							const claim = getSpeechLeaseFromObservation(obs, streamId);
+							if (claim.claimed && claim.leaseId) {
+								leaseId = claim.leaseId;
+								ttsCanStream = true;
+								ttsSpeakLeaseId = leaseId;
+								startSpeechHeartbeat(streamId, leaseId);
+								debugLog(`message_end: recovered late lease stream=${streamId}`);
+							}
+						} catch (err) {
+							debugLog(`message_end lease recovery error for ${streamId}: ${err instanceof Error ? err.message : String(err)}`);
+						}
+					}
 					const claimed = Boolean(leaseId);
 
 					if (ttsInsideSpeak && speechStreamText.trim()) {
@@ -1643,7 +1712,7 @@ speechAgent.subscribe(async (event) => {
 						await sendSpeechFinalize(streamId, leaseId, spokenText, playbackMeta);
 						stopSpeechHeartbeat();
 					} else {
-						await sendSpeechCancel(streamId, leaseId || null);
+						if (leaseId) await sendSpeechCancel(streamId, leaseId);
 						debugLog(`message_end: skipping TTS flush for unclaimed stream ${streamId}`);
 						stopSpeechHeartbeat();
 					}

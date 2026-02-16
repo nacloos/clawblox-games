@@ -37,7 +37,7 @@ gameState:SetAttribute("last_speech_at_ms", 0)
 gameState:SetAttribute("silence_ms", 0)
 gameState:SetAttribute("is_globally_silent", false)
 gameState:SetAttribute("silence_epoch", 0)
-gameState:SetAttribute("silence_threshold_ms", 2000)
+gameState:SetAttribute("silence_threshold_ms", 15000)
 gameState:SetAttribute("pending_speakers", 0)
 gameState:SetAttribute("current_turn_stream_id", "")
 gameState:SetAttribute("current_turn_lease_id", "")
@@ -130,9 +130,9 @@ local speechBus = Instance.new("RemoteEvent")
 speechBus.Name = "SpeechBus"
 speechBus.Parent = ReplicatedStorage
 
-local activeTurn = nil          -- { player_name, stream_id, lease_id, lease_expires_at_ms, finalized, release_at_ms, last_heartbeat_ms, last_progress_seq, last_progress_at_ms }
+local activeTurn = nil          -- { player_name, stream_id, lease_id, lease_expires_at_ms, finalized, release_at_ms, last_heartbeat_ms, last_progress_seq, last_progress_at_ms, final_speech_text }
 local pendingByPlayer = {}      -- player_name -> { stream_id = string, requested_at_ms = number }
-local SILENCE_THRESHOLD_MS = 2000
+local SILENCE_THRESHOLD_MS = 15000
 local DEFAULT_SAMPLE_RATE_HZ = 24000
 local DEFAULT_CHANNELS = 1
 local DEFAULT_BYTES_PER_SAMPLE = 2
@@ -140,11 +140,15 @@ local DEFAULT_PLAYBACK_SPEED = 1.0
 local TURN_LEASE_MS = 7000
 
 local function nowMs()
-    return math.floor(tick() * 1000)
+    return DateTime.now().UnixTimestampMillis
+end
+
+local function simMs()
+    return math.floor(time() * 1000)
 end
 
 local function speechLog(message)
-    print(string.format("[SpeechBus][%d] %s", nowMs(), tostring(message)))
+    print(string.format("[SpeechBus][wall_ms=%d][sim_ms=%d] %s", nowMs(), simMs(), tostring(message)))
 end
 
 local function findPlayerByName(name)
@@ -236,10 +240,11 @@ local function grantSpeech(player, streamId, fromQueue)
         last_progress_seq = 0,
         last_progress_at_ms = now,
         next_wait_log_ms = now,
+        final_speech_text = "",
     }
 
     gameState:SetAttribute("current_speaker", player.Name)
-    gameState:SetAttribute("speaker_claimed_at", tick())
+    gameState:SetAttribute("speaker_claimed_at", nowMs())
     gameState:SetAttribute("is_globally_silent", false)
     gameState:SetAttribute("silence_ms", 0)
     player:SetAttribute("IsSpeaking", true)
@@ -326,6 +331,21 @@ local function releaseActiveTurn(reason)
     gameState:SetAttribute("last_speech_at_ms", now)
     gameState:SetAttribute("silence_ms", 0)
     gameState:SetAttribute("is_globally_silent", false)
+    local finalSpeechText = ""
+    if turn.finalized and type(turn.final_speech_text) == "string" then
+        finalSpeechText = turn.final_speech_text
+    end
+    if finalSpeechText ~= "" then
+        speechBus:FireAllClients({
+            op = "SpeechText",
+            speaker = turn.player_name,
+            stream_id = turn.stream_id,
+            lease_id = turn.lease_id,
+            text = finalSpeechText,
+            release_reason = reason or "released",
+            at_ms = now,
+        })
+    end
     speechBus:FireAllClients({
         op = "Released",
         speaker = turn.player_name,
@@ -567,16 +587,7 @@ speechBus.OnServerEvent:Connect(function(player, payload)
         if type(payload.speech_text) == "string" then
             speechText = payload.speech_text
         end
-        if speechText ~= "" then
-            speechBus:FireAllClients({
-                op = "SpeechText",
-                speaker = player.Name,
-                stream_id = streamId,
-                lease_id = turn.lease_id,
-                text = speechText,
-                at_ms = now,
-            })
-        end
+        turn.final_speech_text = speechText
         if releaseActiveTurn("finalize") then
             grantNextQueuedSpeaker()
             return
@@ -633,6 +644,18 @@ AgentInputService.InputReceived:Connect(function(player, inputType, inputData)
             return
         end
         tallyVotes()
+    elseif inputType == "SpeechFinished" and inputData then
+        local streamId = tostring(inputData.stream_id or "")
+        local reason = tostring(inputData.reason or "unknown")
+        local speaker = tostring(inputData.speaker or player.Name or "")
+        local speechText = tostring(inputData.speech_text or "")
+        speechLog(string.format(
+            "playback_finished speaker=%s stream=%s reason=%s speech_text_len=%d",
+            speaker,
+            streamId,
+            reason,
+            string.len(speechText)
+        ))
     end
 end)
 
@@ -681,7 +704,22 @@ RunService.Heartbeat:Connect(function(dt)
         gameState:SetAttribute("is_globally_silent", isSilent)
         if isSilent then
             local epoch = gameState:GetAttribute("silence_epoch") or 0
-            gameState:SetAttribute("silence_epoch", epoch + 1)
+            local nextEpoch = epoch + 1
+            gameState:SetAttribute("silence_epoch", nextEpoch)
+            speechLog(string.format(
+                "global_silence true epoch=%d silence_ms=%d threshold_ms=%d last_speech_at_ms=%d",
+                nextEpoch,
+                silenceMs,
+                threshold,
+                lastSpeechAt
+            ))
+        else
+            speechLog(string.format(
+                "global_silence false silence_ms=%d threshold_ms=%d current_speaker=%s",
+                silenceMs,
+                threshold,
+                tostring(currentSpeaker or "")
+            ))
         end
     end
 

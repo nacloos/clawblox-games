@@ -758,7 +758,7 @@ function startActionIdleTimer() {
 		if (Date.now() - lastActionActivityAt < ACTION_IDLE_MS) return;
 		lastActionActivityAt = Date.now();
 		injectActionForSpeech([{ action: "still working...", observation: "" }]);
-		if (!state.speechBusy) void runSpeechContinue();
+		if (!state.speechBusy) void runSpeechContinue("action_idle_timer");
 	}, ACTION_IDLE_MS);
 }
 
@@ -828,38 +828,44 @@ function isSpeechTurnBlocked() {
 	return Boolean(speaker) && speaker !== worldAgentName;
 }
 
-async function runSpeechPrompt(text) {
+async function runSpeechPrompt(text, source = "unspecified") {
+	debugLog(`[speech] prompt requested source=${source} busy=${state.speechBusy} closing=${isClosing}`);
 	if (disableSpeechAgent || isClosing || state.speechBusy) return;
 	if (isSpeechTurnBlocked()) {
-		debugLog(`runSpeechPrompt blocked: current_speaker=${getCurrentSpeakerFromObservation(lastObservation)}`);
+		debugLog(`[speech] prompt blocked source=${source} current_speaker=${getCurrentSpeakerFromObservation(lastObservation)}`);
 		return;
 	}
 	state.speechBusy = true;
 	requestRender();
 	try {
+		debugLog(`[speech] prompt start source=${source}`);
 		await speechAgent.prompt(text);
 	} catch (error) {
 		addSpeechLine(`[error] ${error instanceof Error ? error.message : String(error)}`);
 	} finally {
 		state.speechBusy = false;
+		debugLog(`[speech] prompt end source=${source}`);
 		requestRender();
 	}
 }
 
-async function runSpeechContinue() {
+async function runSpeechContinue(source = "unspecified") {
+	debugLog(`[speech] continue requested source=${source} busy=${state.speechBusy} closing=${isClosing}`);
 	if (disableSpeechAgent || isClosing || state.speechBusy) return;
 	if (isSpeechTurnBlocked()) {
-		debugLog(`runSpeechContinue blocked: current_speaker=${getCurrentSpeakerFromObservation(lastObservation)}`);
+		debugLog(`[speech] continue blocked source=${source} current_speaker=${getCurrentSpeakerFromObservation(lastObservation)}`);
 		return;
 	}
 	state.speechBusy = true;
 	requestRender();
 	try {
+		debugLog(`[speech] continue start source=${source}`);
 		await speechAgent.continue();
 	} catch (error) {
 		addSpeechLine(`[error] ${error instanceof Error ? error.message : String(error)}`);
 	} finally {
 		state.speechBusy = false;
+		debugLog(`[speech] continue end source=${source}`);
 		requestRender();
 	}
 }
@@ -1040,6 +1046,31 @@ const pendingSpeechEvents = [];
 const UI_PREVIEW_PREFIX = "[[ui_preview]] ";
 let previewLastSentAt = 0;
 let previewLastText = "";
+const STALL_CUE_MS = Number(process.env.STALL_CUE_MS || "10000");
+const STALL_CUE_COOLDOWN_MS = Number(process.env.STALL_CUE_COOLDOWN_MS || "4000");
+const STALL_CUE_STARTUP_GRACE_MS = Number(process.env.STALL_CUE_STARTUP_GRACE_MS || "1500");
+const STALL_CUE_TEXT = process.env.STALL_CUE_TEXT || "[scene cue]: Everyone stays silent for a moment. The pause turns awkward.";
+let lastConversationActivityAt = Date.now();
+let lastStallCueAt = 0;
+let stallCueTimer = null;
+let stallCueObserveInFlight = false;
+const stallCueStartedAt = Date.now();
+let lastStallSkipReason = "";
+let lastStallSkipLogAt = 0;
+
+function markConversationActivity(source) {
+	lastConversationActivityAt = Date.now();
+	debugLog(`[stall] activity source=${source}`);
+}
+
+function logStallSkip(reason, nowMs = Date.now()) {
+	// Keep logs readable while still exposing timing/gating decisions.
+	if (reason !== lastStallSkipReason || nowMs - lastStallSkipLogAt > 2000) {
+		lastStallSkipReason = reason;
+		lastStallSkipLogAt = nowMs;
+		debugLog(`[stall] skip reason=${reason}`);
+	}
+}
 
 function scheduleSpeechWsReconnect() {
 	if (!speechWsActive || isClosing || speechWsReconnectTimer) return;
@@ -1089,7 +1120,7 @@ function flushDeferredSpeechEvents() {
 			timestamp: Date.now(),
 		});
 	}
-	if (!state.speechBusy) void runSpeechContinue();
+	if (!state.speechBusy) void runSpeechContinue("flushDeferredSpeechEvents");
 }
 
 function handleSpeechEvent(ev) {
@@ -1099,8 +1130,13 @@ function handleSpeechEvent(ev) {
 		if (seq <= speechLastSeq) return;
 		speechLastSeq = seq;
 	}
-	if (ev.speaker === worldAgentName) return;
 	if (typeof ev.text === "string" && ev.text.startsWith(UI_PREVIEW_PREFIX)) return;
+	if (ev.speaker === worldAgentName) {
+		// Ignore own speech events for stall timing.
+		// Self timing is anchored strictly to explicit playback_done WS events.
+		return;
+	}
+	markConversationActivity(`heard:${ev.speaker}`);
 	const currentSpeaker = getCurrentSpeakerFromObservation(lastObservation);
 	if (currentSpeaker && currentSpeaker === ev.speaker) {
 		pendingSpeechEvents.push(ev);
@@ -1113,7 +1149,7 @@ function handleSpeechEvent(ev) {
 		content: [{ type: "text", text: `[${ev.speaker} says]: ${ev.text}` }],
 		timestamp: Date.now(),
 	});
-	if (!state.speechBusy) void runSpeechContinue();
+	if (!state.speechBusy) void runSpeechContinue(`heard:${ev.speaker}`);
 }
 
 function connectSpeechWs() {
@@ -1132,7 +1168,13 @@ function connectSpeechWs() {
 		try {
 			const text = typeof raw === "string" ? raw : Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw);
 			const parsed = JSON.parse(text);
-			handleSpeechEvent(parsed);
+			if (parsed?.type === "speech") {
+				handleSpeechEvent(parsed);
+			} else if (parsed?.type === "playback_done") {
+				if (parsed?.speaker === worldAgentName) {
+					markConversationActivity(`self_playback_done:${parsed?.stream_id || "unknown"}`);
+				}
+			}
 		} catch {
 			// Ignore non-JSON / non-speech messages (state snapshots, binary, etc.).
 		}
@@ -1183,11 +1225,78 @@ function startObserveLoop() {
 			if (!obs) return;
 			injectObserveForSpeech(obs);
 			flushDeferredSpeechEvents();
-			if (!state.speechBusy && speechAgent.state.messages.length > 0) void runSpeechContinue();
+			if (!state.speechBusy && speechAgent.state.messages.length > 0) void runSpeechContinue("observeLoop");
 		} catch (error) {
 			addSpeechLine(`[observe] error: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}, Math.max(250, observeIntervalMs));
+}
+
+function startStallCueLoop() {
+	stopStallCueLoop();
+	stallCueTimer = setInterval(async () => {
+		if (isClosing || disableSpeechAgent) {
+			logStallSkip(`disabled_or_closing disableSpeech=${disableSpeechAgent} closing=${isClosing}`);
+			return;
+		}
+		if (state.speechBusy) {
+			logStallSkip("speech_busy");
+			return;
+		}
+		const nowMs = Date.now();
+		const startupElapsedMs = nowMs - stallCueStartedAt;
+		const idleMs = nowMs - lastConversationActivityAt;
+		const sinceLastCueMs = nowMs - lastStallCueAt;
+		if (startupElapsedMs < STALL_CUE_STARTUP_GRACE_MS) {
+			logStallSkip(`startup_grace remaining=${STALL_CUE_STARTUP_GRACE_MS - startupElapsedMs}ms`);
+			return;
+		}
+		if (idleMs < STALL_CUE_MS) {
+			logStallSkip(`idle_below_threshold idle=${idleMs}ms threshold=${STALL_CUE_MS}ms`);
+			return;
+		}
+		if (sinceLastCueMs < STALL_CUE_COOLDOWN_MS) {
+			logStallSkip(`cooldown remaining=${STALL_CUE_COOLDOWN_MS - sinceLastCueMs}ms`);
+			return;
+		}
+		if (stallCueObserveInFlight) {
+			logStallSkip("observe_in_flight");
+			return;
+		}
+
+		stallCueObserveInFlight = true;
+		try {
+			const obs = await fetchObserve();
+			if (!obs) return;
+			lastObservation = obs;
+			flushDeferredSpeechEvents();
+			const speaker = getCurrentSpeakerFromObservation(obs);
+			if (speaker) {
+				logStallSkip(`speaker_locked speaker=${speaker}`);
+				return;
+			}
+
+			lastStallCueAt = nowMs;
+			markConversationActivity("stall_cue");
+			addSpeechLine(`[stall] injecting scene cue after ${idleMs}ms idle`);
+			debugLog(`[stall] inject trigger idle=${idleMs}ms threshold=${STALL_CUE_MS}ms cooldown=${STALL_CUE_COOLDOWN_MS}ms`);
+			speechAgent.steer({
+				role: "user",
+				content: [{ type: "text", text: STALL_CUE_TEXT }],
+				timestamp: Date.now(),
+			});
+			if (!state.speechBusy) void runSpeechContinue("stall_cue");
+		} catch (error) {
+			debugLog(`[stall] observe error: ${error instanceof Error ? error.message : String(error)}`);
+		} finally {
+			stallCueObserveInFlight = false;
+		}
+	}, 250);
+}
+
+function stopStallCueLoop() {
+	if (stallCueTimer) clearInterval(stallCueTimer);
+	stallCueTimer = null;
 }
 
 speechAgent.subscribe(async (event) => {
@@ -1330,6 +1439,7 @@ speechAgent.subscribe(async (event) => {
 				if (claimed) {
 					const spokenText = ttsSpeakAccum;
 					if (spokenText.trim()) {
+						markConversationActivity("self_spoke");
 						addSpeechLine(`[speak] ${spokenText.slice(0, 80)}`);
 						if (claimed) maybePostSpeechPreview(spokenText, true);
 						// Publish speech text with done chunk; server emits speech event on playback completion.
@@ -1378,7 +1488,7 @@ actionAgent.subscribe((event) => {
 			actionStreamText = actionStreamText.replace(/<step>[\s\S]*?<\/step>/g, "");
 			injectActionForSpeech(activities);
 			lastActionActivityAt = Date.now();
-			if (!state.speechBusy) void runSpeechContinue();
+			if (!state.speechBusy) void runSpeechContinue("action_activity");
 		}
 
 		requestRender();
@@ -1403,6 +1513,7 @@ async function shutdown(reason = "signal") {
 	addActionLine(`Shutting down (${reason})...`);
 
 	stopObserveLoop();
+	stopStallCueLoop();
 	stopSpeechWsLoop();
 	stopActionIdleTimer();
 	try {
@@ -1437,6 +1548,7 @@ addActionLine(`Dual-agent ready with model "${modelName}" (${modelProvider}).`);
 addActionLine(`World joined: ${worldBaseUrl} agent=${worldAgentName}`);
 addActionLine(`Session key: ${worldSession}`);
 addSpeechLine("Non-interactive mode enabled (plain logs, no TUI).");
+// addSpeechLine(`[stall] config threshold=${STALL_CUE_MS}ms cooldown=${STALL_CUE_COOLDOWN_MS}ms startup_grace=${STALL_CUE_STARTUP_GRACE_MS}ms`);
 if (disableSpeechAgent) {
 	addSpeechLine("Speech agent disabled (--no-speech).");
 }
@@ -1456,6 +1568,7 @@ if (audioPlayer) {
 
 // startObserveLoop();  // Disabled: speech agent now receives observations via action agent tool call injection
 startSpeechWsLoop();
+// startStallCueLoop();
 
 if (!disableActionAgent) void runActionPrompt("Fetch the skill commands and observe the world.");
-if (!disableSpeechAgent) void runSpeechPrompt(agentConfig.initial_prompt || "You have just woken up in the world.");
+if (!disableSpeechAgent) void runSpeechPrompt(agentConfig.initial_prompt || "You have just woken up in the world.", "startup_initial_prompt");

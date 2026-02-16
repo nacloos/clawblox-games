@@ -131,8 +131,7 @@ speechBus.Name = "SpeechBus"
 speechBus.Parent = ReplicatedStorage
 
 local activeTurn = nil          -- { player_name, stream_id, lease_id, lease_expires_at_ms, finalized, release_at_ms, last_heartbeat_ms, last_progress_seq, last_progress_at_ms }
-local pendingSpeechQueue = {}   -- array of { player_name = string, stream_id = string, requested_at_ms = number }
-local pendingByPlayer = {}      -- player_name -> stream_id
+local pendingByPlayer = {}      -- player_name -> { stream_id = string, requested_at_ms = number }
 local SILENCE_THRESHOLD_MS = 8000
 local DEFAULT_SAMPLE_RATE_HZ = 24000
 local DEFAULT_CHANNELS = 1
@@ -174,7 +173,11 @@ local function clearSpeakerByName(name)
 end
 
 local function queueSize()
-    return #pendingSpeechQueue
+    local count = 0
+    for _ in pairs(pendingByPlayer) do
+        count += 1
+    end
+    return count
 end
 
 local function setQueueAttrs()
@@ -185,18 +188,14 @@ local function removeQueuedClaimForPlayer(name)
     if not name or name == "" then
         return nil
     end
-    local streamId = pendingByPlayer[name]
+    local claim = pendingByPlayer[name]
     pendingByPlayer[name] = nil
-    if not streamId then
+    if not claim then
         setQueueAttrs()
         return nil
     end
-    for i = #pendingSpeechQueue, 1, -1 do
-        local entry = pendingSpeechQueue[i]
-        if entry and entry.player_name == name then table.remove(pendingSpeechQueue, i) end
-    end
     setQueueAttrs()
-    return streamId
+    return claim.stream_id
 end
 
 local function updateTurnAttrs()
@@ -282,24 +281,36 @@ local function grantNextQueuedSpeaker()
     if activeTurn ~= nil then
         return false
     end
-    while #pendingSpeechQueue > 0 do
-        local entry = table.remove(pendingSpeechQueue, 1)
-        if entry and entry.player_name and pendingByPlayer[entry.player_name] == entry.stream_id then
-            local player = findPlayerByName(entry.player_name)
-            setQueueAttrs()
-            if player then
-                pendingByPlayer[entry.player_name] = nil
-                if grantSpeech(player, entry.stream_id, true) then
-                    return true
+    while queueSize() > 0 do
+        local chosenName = nil
+        local chosenClaim = nil
+        for playerName, claim in pairs(pendingByPlayer) do
+            if type(claim) == "table"
+                and type(claim.stream_id) == "string"
+                and claim.stream_id ~= ""
+                and type(claim.requested_at_ms) == "number" then
+                if chosenClaim == nil or claim.requested_at_ms > chosenClaim.requested_at_ms then
+                    chosenName = playerName
+                    chosenClaim = claim
                 end
-            else
-                pendingByPlayer[entry.player_name] = nil
             end
-        else
+        end
+
+        if not chosenName or not chosenClaim then
+            pendingByPlayer = {}
             setQueueAttrs()
+            return false
+        end
+
+        pendingByPlayer[chosenName] = nil
+        setQueueAttrs()
+        local player = findPlayerByName(chosenName)
+        if player then
+            if grantSpeech(player, chosenClaim.stream_id, true) then
+                return true
+            end
         end
     end
-    setQueueAttrs()
     return false
 end
 
@@ -340,38 +351,34 @@ local function releaseActiveTurn(reason)
 end
 
 local function enqueueClaim(player, streamId)
-    local existingStream = pendingByPlayer[player.Name]
-    if existingStream and existingStream ~= streamId then
-        removeQueuedClaimForPlayer(player.Name)
-    end
-    if pendingByPlayer[player.Name] == streamId then
+    local now = nowMs()
+    local existingClaim = pendingByPlayer[player.Name]
+    if existingClaim and existingClaim.stream_id == streamId then
         speechBus:FireClient(player, {
             op = "Queued",
             stream_id = streamId,
             position = queueSize(),
-            at_ms = nowMs(),
+            at_ms = now,
         })
         return
     end
-    pendingByPlayer[player.Name] = streamId
-    table.insert(pendingSpeechQueue, {
-        player_name = player.Name,
+    pendingByPlayer[player.Name] = {
         stream_id = streamId,
-        requested_at_ms = nowMs(),
-    })
+        requested_at_ms = now,
+    }
     setQueueAttrs()
     speechBus:FireClient(player, {
         op = "Queued",
         stream_id = streamId,
         position = queueSize(),
-        at_ms = nowMs(),
+        at_ms = now,
     })
     speechLog(string.format(
-        "queued speaker=%s stream=%s position=%d active_speaker=%s",
+        "queued_latest speaker=%s stream=%s active_speaker=%s pending_count=%d",
         player.Name,
         streamId,
-        queueSize(),
-        tostring(gameState:GetAttribute("current_speaker") or "")
+        tostring(gameState:GetAttribute("current_speaker") or ""),
+        queueSize()
     ))
 end
 

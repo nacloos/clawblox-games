@@ -1128,6 +1128,31 @@ function startSpeechHeartbeat(streamId, leaseId) {
 	ttsHeartbeatTimer = setInterval(send, 800);
 }
 
+function resetTtsSpeechState() {
+	speechStreamText = "";
+	ttsInsideSpeak = false;
+	ttsSpeakAccum = "";
+	ttsSpeakStreamId = null;
+	ttsSpeakLeaseId = null;
+	ttsCanStream = false;
+	ttsPendingText = "";
+	ttsClaimPromise = null;
+	ttsProgressSeq = 0;
+	ttsLastProgressSentText = "";
+	ttsLastProgressSentAt = 0;
+	stopSpeechHeartbeat();
+}
+
+function cancelPendingSpeechStream(reason = "unknown") {
+	const streamId = ttsSpeakStreamId;
+	if (!streamId) return;
+	const leaseId = ttsSpeakLeaseId || null;
+	debugLog(`[speech] cancel pending stream=${streamId} lease=${leaseId || "(none)"} reason=${reason}`);
+	resetTtsSpeechState();
+	audioPlayer?.interrupt();
+	void sendSpeechCancel(streamId, leaseId);
+}
+
 function maybeSendSpeechProgress(force = false) {
 	if (!ttsCanStream || !ttsSpeakStreamId || !ttsSpeakLeaseId) return;
 	const text = String(ttsSpeakAccum || "");
@@ -1296,6 +1321,11 @@ function handleSpeechEvent(ev) {
 		// Ignore own speech events for stall timing.
 		// Self timing is anchored strictly to explicit playback_done WS events.
 		return;
+	}
+	if (ttsSpeakStreamId) {
+		// Another speaker committed speech while our stream is pending/queued.
+		// Drop it to avoid stale responses being granted later.
+		cancelPendingSpeechStream(`heard_other:${ev.speaker}`);
 	}
 	markConversationActivity(`heard:${ev.speaker}`);
 	// Process heard speech immediately. Deferring on speaker lock caused stalls when

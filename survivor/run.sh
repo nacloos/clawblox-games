@@ -10,8 +10,19 @@ AGENT="$DIR/../agent/agent2.mjs"
 LOGS="$DIR/logs"
 PID_FILE="$DIR/.run.pid"
 AGENTS_DIR="$DIR/templates/agents"
+SERVER_LOG="$LOGS/server.log"
+AUDIO_TIMING_LOG="$WORLD/.clawblox.log"
+CLAWBLOX_BIN="${CLAWBLOX_BIN:-$HOME/.local/bin/clawblox}"
+WORLD_BASE_URL="${WORLD_BASE_URL:-http://localhost:8080}"
+SERVER_READY_TIMEOUT_S="${SERVER_READY_TIMEOUT_S:-300}"
 
 mkdir -p "$LOGS"
+
+if [ ! -x "$CLAWBLOX_BIN" ]; then
+  echo "Missing clawblox binary: $CLAWBLOX_BIN"
+  echo "Set CLAWBLOX_BIN=/path/to/clawblox or install to ~/.local/bin/clawblox"
+  exit 1
+fi
 
 declare -a PIDS=()
 SHUTTING_DOWN=0
@@ -116,11 +127,34 @@ if [ -f "$PID_FILE" ]; then
 fi
 
 # Start server
-: > "$LOGS/server.log"
-echo "Starting clawblox server... (log: logs/server.log)"
-clawblox run "$WORLD" >> "$LOGS/server.log" 2>&1 &
+: > "$SERVER_LOG"
+: > "$AUDIO_TIMING_LOG"
+printf "[%s] [run.sh] starting clawblox run path=%s\n" "$(date +%s%3N)" "$WORLD" >> "$AUDIO_TIMING_LOG"
+echo "Starting clawblox server... (log: $SERVER_LOG)"
+echo "Audio timing log: $AUDIO_TIMING_LOG"
+echo "Using clawblox binary: $CLAWBLOX_BIN"
+"$CLAWBLOX_BIN" run "$WORLD" >> "$SERVER_LOG" 2>&1 &
 PIDS+=("$!")
-sleep 3
+
+echo "Waiting for server readiness at $WORLD_BASE_URL/spectate ..."
+ready=0
+max_checks=$((SERVER_READY_TIMEOUT_S * 4))
+for _ in $(seq 1 "$max_checks"); do
+  if ! is_alive "${PIDS[0]}"; then
+    echo "Server process exited before readiness. Check $SERVER_LOG"
+    exit 1
+  fi
+  if curl -fsS "$WORLD_BASE_URL/spectate" >/dev/null 2>&1; then
+    ready=1
+    break
+  fi
+  sleep 0.25
+done
+if [ "$ready" -ne 1 ]; then
+  echo "Server did not become ready within ${SERVER_READY_TIMEOUT_S}s. Check $SERVER_LOG"
+  exit 1
+fi
+echo "Server is ready."
 
 if [ ! -d "$AGENTS_DIR" ]; then
   echo "Missing agents directory: $AGENTS_DIR"
@@ -154,6 +188,7 @@ printf "%s\n" "${PIDS[@]}" > "$PID_FILE"
 
 echo ""
 echo "Server + ${#AGENTS[@]} agents running. Open http://localhost:8080"
+echo "Audio timing lines: rg \"\\[audio\\] (estimate|complete)\" \"$AUDIO_TIMING_LOG\""
 echo "Ctrl+C to stop all."
 
 # If any child exits, shut everything down.

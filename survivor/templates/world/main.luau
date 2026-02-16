@@ -144,6 +144,10 @@ local function nowMs()
     return math.floor(tick() * 1000)
 end
 
+local function speechLog(message)
+    print(string.format("[SpeechBus][%d] %s", nowMs(), tostring(message)))
+end
+
 local function findPlayerByName(name)
     for _, p in ipairs(Players:GetPlayers()) do
         if p.Name == name then
@@ -227,10 +231,12 @@ local function grantSpeech(player, streamId, fromQueue)
         lease_id = leaseId,
         lease_expires_at_ms = now + TURN_LEASE_MS,
         finalized = false,
+        finalized_at_ms = nil,
         release_at_ms = nil,
         last_heartbeat_ms = now,
         last_progress_seq = 0,
         last_progress_at_ms = now,
+        next_wait_log_ms = now,
     }
 
     gameState:SetAttribute("current_speaker", player.Name)
@@ -260,6 +266,15 @@ local function grantSpeech(player, streamId, fromQueue)
         from_queue = fromQueue == true,
         at_ms = now,
     })
+    speechLog(string.format(
+        "granted speaker=%s stream=%s lease=%s from_queue=%s queue_len=%d lease_expires_at_ms=%d",
+        player.Name,
+        streamId,
+        leaseId,
+        tostring(fromQueue == true),
+        queueSize(),
+        activeTurn.lease_expires_at_ms or 0
+    ))
     return true, leaseId
 end
 
@@ -308,6 +323,19 @@ local function releaseActiveTurn(reason)
         reason = reason or "released",
         at_ms = now,
     })
+    local heldMs = 0
+    if turn and turn.finalized_at_ms and turn.finalized_at_ms > 0 then
+        heldMs = math.max(0, now - turn.finalized_at_ms)
+    end
+    speechLog(string.format(
+        "released speaker=%s stream=%s lease=%s reason=%s held_after_finalize_ms=%d queue_len=%d",
+        turn.player_name or "",
+        turn.stream_id or "",
+        turn.lease_id or "",
+        tostring(reason or "released"),
+        heldMs,
+        queueSize()
+    ))
     return true
 end
 
@@ -338,6 +366,13 @@ local function enqueueClaim(player, streamId)
         position = queueSize(),
         at_ms = nowMs(),
     })
+    speechLog(string.format(
+        "queued speaker=%s stream=%s position=%d active_speaker=%s",
+        player.Name,
+        streamId,
+        queueSize(),
+        tostring(gameState:GetAttribute("current_speaker") or "")
+    ))
 end
 
 local function parsePositiveNumber(value, fallback)
@@ -433,6 +468,14 @@ speechBus.OnServerEvent:Connect(function(player, payload)
             return
         end
         enqueueClaim(player, streamId)
+        speechLog(string.format(
+            "claim_deferred speaker=%s stream=%s active_speaker=%s active_stream=%s queue_len=%d",
+            player.Name,
+            streamId,
+            tostring(activeTurn and activeTurn.player_name or ""),
+            tostring(activeTurn and activeTurn.stream_id or ""),
+            queueSize()
+        ))
         return
     end
 
@@ -494,12 +537,24 @@ speechBus.OnServerEvent:Connect(function(player, payload)
         if turn.finalized then
             return
         end
-        local durationMs = parsePlaybackDurationMs(payload)
+        local reportedDurationMs = parsePlaybackDurationMs(payload)
         local now = nowMs()
         turn.finalized = true
-        turn.release_at_ms = now + durationMs
+        turn.finalized_at_ms = now
+        turn.release_at_ms = now
         turn.lease_expires_at_ms = now + TURN_LEASE_MS
+        turn.next_wait_log_ms = now
         updateTurnAttrs()
+        speechLog(string.format(
+            "finalize speaker=%s stream=%s lease=%s reported_duration_ms=%d release_at_ms=%d now_ms=%d last_progress_seq=%d",
+            player.Name,
+            streamId,
+            tostring(turn.lease_id),
+            reportedDurationMs,
+            turn.release_at_ms or 0,
+            now,
+            tonumber(turn.last_progress_seq or 0) or 0
+        ))
 
         local speechText = ""
         if type(payload.speech_text) == "string" then
@@ -515,11 +570,9 @@ speechBus.OnServerEvent:Connect(function(player, payload)
                 at_ms = now,
             })
         end
-        if durationMs <= 0 then
-            if releaseActiveTurn("natural_end") then
-                grantNextQueuedSpeaker()
-                return
-            end
+        if releaseActiveTurn("finalize") then
+            grantNextQueuedSpeaker()
+            return
         end
         return
     end
@@ -584,6 +637,16 @@ RunService.Heartbeat:Connect(function(dt)
     local now = nowMs()
     if activeTurn then
         if activeTurn.finalized then
+            if activeTurn.release_at_ms and now < activeTurn.release_at_ms and now >= (activeTurn.next_wait_log_ms or 0) then
+                local waitRemaining = math.max(0, activeTurn.release_at_ms - now)
+                speechLog(string.format(
+                    "waiting_release speaker=%s stream=%s wait_remaining_ms=%d",
+                    tostring(activeTurn.player_name or ""),
+                    tostring(activeTurn.stream_id or ""),
+                    waitRemaining
+                ))
+                activeTurn.next_wait_log_ms = now + 1000
+            end
             if activeTurn.release_at_ms and now >= activeTurn.release_at_ms then
                 releaseActiveTurn("natural_end")
                 grantNextQueuedSpeaker()

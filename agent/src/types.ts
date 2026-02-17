@@ -16,6 +16,7 @@ export type SpeechEvent = {
   seq: number;
   speaker: string;
   text: string;
+  target?: string;
 };
 
 export type PlaybackDoneEvent = {

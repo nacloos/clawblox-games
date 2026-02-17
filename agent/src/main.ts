@@ -11,6 +11,13 @@ import { SpeechAgentRuntime } from "./llm.js";
 import { TurnEngine } from "./turn.js";
 import { summarizeActionObservation } from "./action-result.js";
 
+function speechTargetMatches(eventTarget: unknown, agentName: string): boolean {
+  if (typeof eventTarget !== "string" || eventTarget.trim() === "" || eventTarget === "*") {
+    return true;
+  }
+  return eventTarget === agentName;
+}
+
 function loadCodexAccessToken(scriptDir: string, logWarn: (msg: string) => void): string | undefined {
   const candidates = [path.join(process.cwd(), "auth.json"), path.join(scriptDir, "auth.json")];
   for (const p of candidates) {
@@ -88,7 +95,9 @@ async function main() {
   );
 
   server.connectSpectateWs("actor", (event) => {
-    if (isSpeechEvent(event) && event.speaker !== config.agentName) {
+    if (isSpeechEvent(event)
+      && speechTargetMatches(event.target, config.agentName)
+      && event.speaker !== config.agentName) {
       void turnEngine.onHeard(event);
       return;
     }

@@ -140,9 +140,11 @@ export class TurnEngine {
     this.logger.speech(
       `server_silence epoch=${this.silenceLoopEpoch} silence_ms=${this.silenceLoopSilenceMs} trigger=${trigger}`,
     );
-    this.silenceCueSeq += 1;
-    const cueKey = `server_silence:${this.silenceLoopEpoch}:${this.silenceCueSeq}`;
-    await this.store.appendUserText(this.stallCueText, cueKey);
+    if (trigger === "new") {
+      this.silenceCueSeq += 1;
+      const cueKey = `server_silence:${this.silenceLoopEpoch}:${this.silenceCueSeq}`;
+      await this.store.appendUserText(this.stallCueText, cueKey);
+    }
     this.llm.steerUser(this.stallCueText);
     this.speech.markHeardEpoch();
     if (!this.busy) {

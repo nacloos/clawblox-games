@@ -46,6 +46,7 @@ gameState.Parent = Workspace
 
 local votes = {}       -- private: { [playerName] = targetName }
 local idolPlays = {}   -- private: { [playerName] = targetName }
+local allVotesInCueSent = false
 
 local function countVoters()
     local n = 0
@@ -149,6 +150,22 @@ end
 
 local function speechLog(message)
     print(string.format("[SpeechBus][wall_ms=%d][sim_ms=%d] %s", nowMs(), simMs(), tostring(message)))
+end
+
+local function emitSpeechText(speakerName, text, releaseReason, targetName)
+    if type(text) ~= "string" or text == "" then
+        return
+    end
+    speechBus:FireAllClients({
+        op = "SpeechText",
+        speaker = tostring(speakerName or ""),
+        stream_id = "",
+        lease_id = "",
+        text = text,
+        release_reason = tostring(releaseReason or "system"),
+        target = targetName or "*",
+        at_ms = nowMs(),
+    })
 end
 
 local function findPlayerByName(name)
@@ -384,6 +401,7 @@ local function releaseActiveTurn(reason)
             lease_id = turn.lease_id,
             text = finalSpeechText,
             release_reason = reason or "released",
+            target = "*",
             at_ms = now,
         })
     end
@@ -672,6 +690,15 @@ AgentInputService.InputReceived:Connect(function(player, inputType, inputData)
             -- Host decides when to reveal. Keep votes private until RevealVotes.
             gameState:SetAttribute("can_reveal_votes", true)
             gameState:SetAttribute("phase", "awaiting_reveal")
+            if not allVotesInCueSent then
+                allVotesInCueSent = true
+                emitSpeechText("producer", "All votes are in. Host, reveal when ready.", "system_cue", "host")
+                speechLog(string.format(
+                    "system_cue target=host kind=all_votes_in votes_received=%d total_voters=%d",
+                    received,
+                    gameState:GetAttribute("total_voters") or 0
+                ))
+            end
         end
     elseif inputType == "UseIdol" and inputData and inputData.target then
         idolPlays[player.Name] = inputData.target

@@ -163,6 +163,7 @@ export function loadRuntimeConfig(argv: string[]): RuntimeConfig {
     "Use <silence></silence> to say nothing. Only speak when addressed or you have something important to add.",
     "Keep it concise (one sentence preferred).",
     "To take a world action, output JSON payload inside <action>...</action> with {\"type\":\"...\",\"data\":{...}}.",
+    "After you cast a vote, briefly announce once that your vote is in so the host can proceed.",
     workspaceContext
   ].join("\n\n");
 

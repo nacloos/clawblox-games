@@ -9,8 +9,9 @@ import { NoopTtsClient } from "./noop-tts-client.js";
 import { SpeechPipeline } from "./speech.js";
 import { SpeechAgentRuntime } from "./llm.js";
 import { TurnEngine } from "./turn.js";
+import { summarizeActionObservation } from "./action-result.js";
 
-function loadCodexAccessToken(scriptDir: string): string | undefined {
+function loadCodexAccessToken(scriptDir: string, logWarn: (msg: string) => void): string | undefined {
   const candidates = [path.join(process.cwd(), "auth.json"), path.join(scriptDir, "auth.json")];
   for (const p of candidates) {
     if (!existsSync(p)) continue;
@@ -18,8 +19,10 @@ function loadCodexAccessToken(scriptDir: string): string | undefined {
       const auth = JSON.parse(readFileSync(p, "utf8")) as Record<string, any>;
       const creds = auth?.["openai-codex"];
       if (creds && typeof creds.access === "string" && creds.access.length > 0) return creds.access;
-    } catch {
-      // ignore
+    } catch (err) {
+      logWarn(
+        `codex_auth_parse_failed path=${p} err=${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
   return undefined;
@@ -29,10 +32,10 @@ async function main() {
   const config = loadRuntimeConfig(process.argv.slice(2));
   const logger = new Logger(config.debugLogPath, ` [agent=${config.agentName} pid=${process.pid}]`);
 
-  const server = new WorldServerClient(config.worldBaseUrl, config.agentName);
+  const server = new WorldServerClient(config.worldBaseUrl, config.agentName, (msg) => logger.warn(msg));
   await server.join();
 
-  const codexAccessToken = loadCodexAccessToken(path.join(config.gameDir, "../agent"));
+  const codexAccessToken = loadCodexAccessToken(path.join(config.gameDir, "../agent"), (msg) => logger.warn(msg));
   const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
 
   const speechAgent = new SpeechAgentRuntime(
@@ -67,16 +70,19 @@ async function main() {
     logger,
     async (action) => {
       if (config.noAction) {
-        logger.action(`skip action (--no-action) type=${action.type}`);
-        return;
+        const summary = `action=${action.type} | skipped (--no-action)`;
+        logger.action(summary);
+        return { ok: false, actionType: action.type, summary };
       }
       try {
-        await server.input(action.type, action.data);
-        logger.action(`input sent type=${action.type}`);
+        const observation = await server.input(action.type, action.data);
+        const summary = summarizeActionObservation(action.type, observation);
+        logger.action(summary);
+        return { ok: true, actionType: action.type, summary };
       } catch (err) {
-        logger.action(
-          `input failed type=${action.type} err=${err instanceof Error ? err.message : String(err)}`,
-        );
+        const summary = `action=${action.type} | request_failed err=${err instanceof Error ? err.message : String(err)}`;
+        logger.action(summary);
+        return { ok: false, actionType: action.type, summary };
       }
     },
   );

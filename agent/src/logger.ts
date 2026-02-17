@@ -16,4 +16,12 @@ export class Logger {
   action(msg: string) {
     this.line(`[action] ${msg}`);
   }
+
+  warn(msg: string) {
+    this.line(`[warn] ${msg}`);
+  }
+
+  error(msg: string) {
+    this.line(`[error] ${msg}`);
+  }
 }

@@ -9,7 +9,14 @@ export class WorldServerClient {
   private ws: any = null;
   private silenceEventCursor = 0;
 
-  constructor(private readonly baseUrl: string, private readonly agentName: string) {}
+  constructor(
+    private readonly baseUrl: string,
+    private readonly agentName: string,
+    private readonly logWarn: (msg: string) => void = (msg) => {
+      // eslint-disable-next-line no-console
+      console.error(msg);
+    },
+  ) {}
 
   getSession() {
     return this.session;
@@ -90,8 +97,14 @@ export class WorldServerClient {
             onEvent(silence);
           }
         }
-      } catch {
-        // ignore non-json payloads
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        const preview = typeof raw === "string"
+          ? raw.slice(0, 180)
+          : Buffer.isBuffer(raw)
+            ? raw.toString("utf8").slice(0, 180)
+            : String(raw).slice(0, 180);
+        this.logWarn(`spectate_ws_message_parse_failed reason=${reason} preview=${preview}`);
       }
     });
   }

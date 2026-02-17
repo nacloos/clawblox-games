@@ -6,7 +6,8 @@ set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 WORLD="$DIR/templates/world"
-AGENT="$DIR/../agent/agent2.mjs"
+AGENT_SRC_DIR="$DIR/../agent"
+AGENT_ENTRY="$AGENT_SRC_DIR/dist/main.js"
 LOGS="$DIR/logs"
 PID_FILE="$DIR/.run.pid"
 AGENTS_DIR="$DIR/templates/agents"
@@ -21,6 +22,22 @@ mkdir -p "$LOGS"
 if [ ! -x "$CLAWBLOX_BIN" ]; then
   echo "Missing clawblox binary: $CLAWBLOX_BIN"
   echo "Set CLAWBLOX_BIN=/path/to/clawblox or install to ~/.local/bin/clawblox"
+  exit 1
+fi
+
+if [ ! -d "$AGENT_SRC_DIR" ]; then
+  echo "Missing agent directory: $AGENT_SRC_DIR"
+  exit 1
+fi
+
+echo "Building modular agent runtime..."
+(
+  cd "$AGENT_SRC_DIR"
+  npm run build >/dev/null
+)
+
+if [ ! -f "$AGENT_ENTRY" ]; then
+  echo "Missing built agent entry: $AGENT_ENTRY"
   exit 1
 fi
 
@@ -178,7 +195,7 @@ fi
 for name in "${AGENTS[@]}"; do
   : > "$LOGS/$name.log"
   echo "Launching $name... (log: logs/$name.log)"
-  node "$AGENT" --name "$name" --dir "$DIR" --no-action "${AGENT_EXTRA_ARGS[@]}" >> "$LOGS/$name.log" 2>&1 &
+  node "$AGENT_ENTRY" --name "$name" --dir "$DIR" --no-action "${AGENT_EXTRA_ARGS[@]}" >> "$LOGS/$name.log" 2>&1 &
   PIDS+=("$!")
 done
 sleep 3

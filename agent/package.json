@@ -1,10 +1,11 @@
 {
   "name": "game_agent",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "modular survivor agent runtime",
+  "main": "dist/main.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build": "node /home/nacloos/Code/pi-mono/node_modules/typescript/bin/tsc -p tsconfig.json",
+    "start": "node dist/main.js"
   },
   "keywords": [],
   "author": "",

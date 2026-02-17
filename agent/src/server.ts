@@ -1,5 +1,5 @@
 import WebSocketClient from "ws";
-import type { PlaybackDoneEvent, SpectateEvent, SpeechClaim, SpeechEvent } from "./types.js";
+import type { GlobalSilenceEvent, PlaybackDoneEvent, SpectateEvent, SpeechClaim, SpeechEvent } from "./types.js";
 
 export type ObserveSnapshot = Record<string, unknown>;
 
@@ -7,6 +7,7 @@ export class WorldServerClient {
   private session = "";
   private agentId = "";
   private ws: any = null;
+  private silenceEventCursor = 0;
 
   constructor(private readonly baseUrl: string, private readonly agentName: string) {}
 
@@ -82,6 +83,13 @@ export class WorldServerClient {
         const text = typeof raw === "string" ? raw : Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw);
         const parsed = JSON.parse(text) as SpectateEvent;
         onEvent(parsed);
+        if (parsed && typeof parsed === "object") {
+          const extracted = extractGlobalSilenceEvents(parsed as Record<string, unknown>, this.silenceEventCursor);
+          this.silenceEventCursor = extracted.cursor;
+          for (const silence of extracted.events) {
+            onEvent(silence);
+          }
+        }
       } catch {
         // ignore non-json payloads
       }
@@ -102,4 +110,51 @@ export function isSpeechEvent(event: SpectateEvent): event is SpeechEvent {
 
 export function isPlaybackDoneEvent(event: SpectateEvent): event is PlaybackDoneEvent {
   return event.type === "playback_done";
+}
+
+export function isGlobalSilenceEvent(event: SpectateEvent): event is GlobalSilenceEvent {
+  return event.type === "global_silence";
+}
+
+function extractGlobalSilenceEvents(
+  snapshot: Record<string, unknown>,
+  cursor: number,
+): { events: GlobalSilenceEvent[]; cursor: number } {
+  const out: GlobalSilenceEvent[] = [];
+  let nextCursor = cursor;
+
+  const recentEvents = snapshot.recent_events;
+  if (!Array.isArray(recentEvents)) {
+    return { events: out, cursor: nextCursor };
+  }
+
+  for (const event of recentEvents) {
+    if (!event || typeof event !== "object") continue;
+    const obj = event as Record<string, unknown>;
+    const id = Number(obj.id);
+    if (!Number.isFinite(id)) continue;
+    const eventId = Math.floor(id);
+    if (eventId <= nextCursor) continue;
+
+    if (eventId > nextCursor) nextCursor = eventId;
+
+    const name = String(obj.name || "");
+    if (name !== "SpeechBus") continue;
+
+    const payload = obj.payload;
+    if (!payload || typeof payload !== "object") continue;
+    const payloadObj = payload as Record<string, unknown>;
+    const op = String(payloadObj.op || "");
+    if (op !== "GlobalSilence") continue;
+
+    const epochRaw = Number(payloadObj.epoch || 0);
+    if (!Number.isFinite(epochRaw) || epochRaw <= 0) continue;
+    const epoch = Math.floor(epochRaw);
+
+    const silenceMsRaw = Number(payloadObj.silence_ms || 0);
+    const silenceMs = Number.isFinite(silenceMsRaw) && silenceMsRaw > 0 ? Math.floor(silenceMsRaw) : 0;
+    out.push({ type: "global_silence", epoch, silence_ms: silenceMs });
+  }
+
+  return { events: out, cursor: nextCursor };
 }

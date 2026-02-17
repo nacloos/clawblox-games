@@ -195,7 +195,7 @@ fi
 for name in "${AGENTS[@]}"; do
   : > "$LOGS/$name.log"
   echo "Launching $name... (log: logs/$name.log)"
-  node "$AGENT_ENTRY" --name "$name" --dir "$DIR" --no-action "${AGENT_EXTRA_ARGS[@]}" >> "$LOGS/$name.log" 2>&1 &
+  node "$AGENT_ENTRY" --name "$name" --dir "$DIR" "${AGENT_EXTRA_ARGS[@]}" >> "$LOGS/$name.log" 2>&1 &
   PIDS+=("$!")
 done
 sleep 3

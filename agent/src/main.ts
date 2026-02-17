@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { loadRuntimeConfig } from "./config.js";
 import { Logger } from "./logger.js";
 import { ConversationStore } from "./conversation.js";
-import { WorldServerClient, isPlaybackDoneEvent, isSpeechEvent } from "./server.js";
+import { WorldServerClient, isGlobalSilenceEvent, isPlaybackDoneEvent, isSpeechEvent } from "./server.js";
 import { ElevenLabsClient } from "./elevenlabs-client.js";
 import { NoopTtsClient } from "./noop-tts-client.js";
 import { SpeechPipeline } from "./speech.js";
@@ -60,7 +60,26 @@ async function main() {
   const store = new ConversationStore(config.speechConversationPath, logger);
   speechAgent.replaceMessages(store.snapshot().messages);
 
-  const turnEngine = new TurnEngine(store, speechAgent, speech, logger);
+  const turnEngine = new TurnEngine(
+    store,
+    speechAgent,
+    speech,
+    logger,
+    async (action) => {
+      if (config.noAction) {
+        logger.action(`skip action (--no-action) type=${action.type}`);
+        return;
+      }
+      try {
+        await server.input(action.type, action.data);
+        logger.action(`input sent type=${action.type}`);
+      } catch (err) {
+        logger.action(
+          `input failed type=${action.type} err=${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    },
+  );
 
   server.connectSpectateWs("actor", (event) => {
     if (isSpeechEvent(event) && event.speaker !== config.agentName) {
@@ -69,6 +88,10 @@ async function main() {
     }
     if (isPlaybackDoneEvent(event) && event.speaker === config.agentName) {
       speech.notifyPlaybackDone(event.stream_id);
+      return;
+    }
+    if (isGlobalSilenceEvent(event)) {
+      void turnEngine.onGlobalSilence(event.epoch, event.silence_ms);
     }
   });
 

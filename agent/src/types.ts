@@ -26,7 +26,17 @@ export type PlaybackDoneEvent = {
   reason?: string;
 };
 
-export type SpectateEvent = SpeechEvent | PlaybackDoneEvent | Record<string, unknown>;
+export type GlobalSilenceEvent = {
+  type: "global_silence";
+  epoch: number;
+  silence_ms: number;
+};
+
+export type SpectateEvent =
+  | SpeechEvent
+  | PlaybackDoneEvent
+  | GlobalSilenceEvent
+  | Record<string, unknown>;
 
 export type AgentConfig = {
   initial_prompt?: string;

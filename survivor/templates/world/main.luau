@@ -747,6 +747,14 @@ RunService.Heartbeat:Connect(function(dt)
             local epoch = gameState:GetAttribute("silence_epoch") or 0
             local nextEpoch = epoch + 1
             gameState:SetAttribute("silence_epoch", nextEpoch)
+            speechBus:FireAllClients({
+                op = "GlobalSilence",
+                epoch = nextEpoch,
+                silence_ms = silenceMs,
+                threshold_ms = threshold,
+                last_speech_at_ms = lastSpeechAt,
+                at_ms = now,
+            })
             speechLog(string.format(
                 "global_silence true epoch=%d silence_ms=%d threshold_ms=%d last_speech_at_ms=%d",
                 nextEpoch,

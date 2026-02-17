@@ -29,6 +29,10 @@ venv/
 
 # Agent runtime output
 **/results/
+agent/node_modules/
+agent/auth.json
+agent_mjs/
+survivor/.run.pid
 
 # Generated renderer bundle
 dist/

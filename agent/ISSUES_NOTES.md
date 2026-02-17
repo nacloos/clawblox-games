@@ -2,6 +2,16 @@
 
 Updated: 2026-02-16
 
+## Current Status Snapshot (2026-02-16)
+
+- Historical issues below are intentionally preserved for debugging history.
+- New architecture changes now in place:
+  - `main.luau` is policy authority for turn release and final speech publication (`SpeechText` emitted on release path).
+  - `cli.rs` no longer authors final speech timing from audio completion; it forwards authoritative `SpeechBus/SpeechText` replicated events.
+  - `agent2` removed stale-lease recovery paths and now uses strict stale abort/cancel behavior.
+- Remaining risk to monitor:
+  - claim contention and lease-expiry loops under high concurrent agent activity (separate from stale resurrection).
+
 ## 1) Early playback completion (heard audio still playing)
 
 - Symptom: server/frontend reported stream complete before audible end.
@@ -51,14 +61,15 @@ Updated: 2026-02-16
 - Root cause:
   - aggressive cancel-on-`heard_other` behavior combined with concurrent claim retries.
   - pending turn attempts were cancelled too often before stabilization.
-- Partial fix in progress:
-  - removed cancel-on-heard for unclaimed/pending attempts,
-  - added speech event epoch guard so stale claim retries abort.
-- Observed regression after partial fix:
-  - to prevent "grant then immediate cancel", late-lease recovery was added.
-  - this can resurrect stale queued drafts and let outdated turns speak.
-- Goal:
-  - preserve anti-stale behavior without destroying in-flight turn attempts.
+- Historical progression:
+  - partial fix added epoch guard,
+  - then late-lease recovery was introduced to reduce grant->cancel race,
+  - late-lease recovery caused stale resurrection regressions.
+- Current status:
+  - stale-lease recovery removed from `agent2`,
+  - stale streams now abort/cancel instead of being resurrected.
+- Remaining goal:
+  - reduce claim/lease contention without reintroducing stale speech.
 
 ## 7) Tradeoff bug: stale resurrection vs grant-cancel race
 
@@ -73,6 +84,9 @@ Updated: 2026-02-16
 - Required design direction:
   - keep server-authoritative lease safety,
   - but bind each generated draft to a conversation epoch and reject speaking if superseded.
+- Current status:
+  - strict stale cancel is now active in `agent2` (no stale-lease recovery).
+  - this addresses stale resurrection symptom B; monitor if symptom A resurfaces under load.
 
 ## 8) Global silence cue side effects
 
@@ -80,6 +94,26 @@ Updated: 2026-02-16
 - Change made:
   - server silence cue injection now disabled by default.
   - can be re-enabled with `ENABLE_SERVER_SILENCE_CUE=1`.
+
+## 9) Message delivery consistency break (major)
+
+- Severity: high (conversation state divergence).
+- Invariant:
+  - all actor agents must receive the same committed speech messages in order.
+- Observed issue:
+  - Stephanie line `"Oh, we're all paying attention, trust me."` was not persisted in every agent's `speech_conversation.json`.
+  - Present in:
+    - `results/rodger_dodger/speech_conversation.json`
+    - `results/tommy/speech_conversation.json`
+    - `results/yasmin/speech_conversation.json`
+  - Missing in:
+    - `results/host/speech_conversation.json`
+    - `results/guy/speech_conversation.json`
+- Note:
+  - debug logs for host/guy showed `heard:stephanie` activity, so this appears as a delivery/persistence consistency race rather than a simple no-delivery case.
+- Required outcome:
+  - every committed `SpeechText` from server must be durably applied to every actor agent context exactly once.
+  - no agent should advance turn logic without that message in its persisted conversation history.
 
 ## Key log signatures
 
@@ -92,12 +126,17 @@ Updated: 2026-02-16
 - Stale resurrection:
   - `recovered granted lease for stale stream ...`
   - followed by speech that ignores newer `heard:*` context.
+- Message consistency break:
+  - a committed speech line appears in some agents' `speech_conversation.json` but is missing in others for the same run.
 - Host-only run:
   - only one `agent2.mjs` process in `ps`.
   - server observations show only host joined.
 
 ## Current debugging priority
 
-- Stabilize turn-attempt state machine under contention.
-- Ensure one committed response survives after each heard message.
-- Keep stale-response protection without global cancel storms.
+- Validate that stale resurrection signature is gone:
+  - `recovered granted lease for stale stream ...` should no longer appear.
+- Continue reducing lease-expiry contention:
+  - long `claim_deferred` loops,
+  - `released ... reason=lease_expired`,
+  - delayed next-speaker starts under heavy overlap.

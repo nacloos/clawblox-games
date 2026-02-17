@@ -184,8 +184,44 @@ local function queueSize()
     return count
 end
 
+local function isClaimStale(claim)
+    if type(claim) ~= "table" then
+        return true
+    end
+    local requestedAt = tonumber(claim.requested_at_ms or 0) or 0
+    local lastSpeechAt = tonumber(gameState:GetAttribute("last_speech_at_ms") or 0) or 0
+    -- Any queued claim created before (or exactly at) the most recent committed speech
+    -- is stale for the next turn and should not be granted.
+    return requestedAt > 0 and requestedAt <= lastSpeechAt
+end
+
 local function setQueueAttrs()
     gameState:SetAttribute("pending_speakers", queueSize())
+end
+
+local function dropStaleQueuedClaims(cutoffMs)
+    local cutoff = tonumber(cutoffMs or 0) or 0
+    if cutoff <= 0 then
+        return 0
+    end
+    local dropped = 0
+    for playerName, claim in pairs(pendingByPlayer) do
+        if type(claim) == "table" and isClaimStale(claim) then
+            speechLog(string.format(
+                "drop_stale_claim speaker=%s stream=%s requested_at_ms=%d last_speech_at_ms=%d",
+                tostring(playerName),
+                tostring(claim.stream_id or ""),
+                tonumber(claim.requested_at_ms or 0) or 0,
+                cutoff
+            ))
+            pendingByPlayer[playerName] = nil
+            dropped += 1
+        end
+    end
+    if dropped > 0 then
+        setQueueAttrs()
+    end
+    return dropped
 end
 
 local function removeQueuedClaimForPlayer(name)
@@ -302,8 +338,10 @@ local function grantNextQueuedSpeaker()
         end
 
         if not chosenName or not chosenClaim then
-            pendingByPlayer = {}
-            setQueueAttrs()
+            if queueSize() > 0 then
+                pendingByPlayer = {}
+                setQueueAttrs()
+            end
             return false
         end
 
@@ -331,6 +369,9 @@ local function releaseActiveTurn(reason)
     gameState:SetAttribute("last_speech_at_ms", now)
     gameState:SetAttribute("silence_ms", 0)
     gameState:SetAttribute("is_globally_silent", false)
+    -- Important ordering: drop stale queued claims before broadcasting committed
+    -- speech so only fresh post-message claims compete for the next turn.
+    dropStaleQueuedClaims(now)
     local finalSpeechText = ""
     if turn.finalized and type(turn.final_speech_text) == "string" then
         finalSpeechText = turn.final_speech_text

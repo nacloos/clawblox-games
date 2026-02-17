@@ -892,6 +892,7 @@ function addActionLine(text) {
 
 function persistSpeechConversation() {
 	writeFileSync(speechConversationPath, JSON.stringify(speechAgent.state.messages, null, 2));
+	debugLog(`[speech] persisted conversation path=${speechConversationPath} messages=${Array.isArray(speechAgent?.state?.messages) ? speechAgent.state.messages.length : 0}`);
 }
 
 function persistActionConversation() {
@@ -1278,6 +1279,52 @@ function logStallSkip(reason, nowMs = Date.now()) {
 	}
 }
 
+function lastSpeechMessageText() {
+	const msgs = speechAgent?.state?.messages;
+	if (!Array.isArray(msgs) || msgs.length === 0) return "";
+	const last = msgs[msgs.length - 1];
+	const parts = Array.isArray(last?.content) ? last.content : [];
+	if (parts.length === 0) return "";
+	return String(parts.map((p) => (p && p.type === "text" ? p.text : "")).join(""));
+}
+
+function persistSpeechConversationAfterSteer(expectedText) {
+	const expected = String(expectedText || "");
+	const maxAttempts = 12;
+	const delayMs = 25;
+	let attempts = 0;
+	debugLog(`[speech] persist_after_steer start expected="${expected.slice(0, 100)}"`);
+	const tryPersist = () => {
+		attempts += 1;
+		const tail = lastSpeechMessageText();
+		if (!expected || tail.includes(expected) || attempts >= maxAttempts) {
+			if (attempts >= maxAttempts && expected && !tail.includes(expected)) {
+				debugLog(`[speech] persist retry exhausted missing_expected="${expected.slice(0, 80)}" tail="${tail.slice(0, 80)}"`);
+			}
+			debugLog(`[speech] persist_after_steer commit attempts=${attempts} matched=${expected ? tail.includes(expected) : true}`);
+			persistSpeechConversation();
+			return;
+		}
+		if (attempts === 1 || attempts === maxAttempts - 1) {
+			debugLog(`[speech] persist_after_steer retry attempts=${attempts} tail="${tail.slice(0, 100)}"`);
+		}
+		setTimeout(tryPersist, delayMs);
+	};
+	tryPersist();
+}
+
+function applyHeardSpeechToConversation(ev) {
+	const heardText = `[${ev.speaker} says]: ${ev.text}`;
+	debugLog(`[speech] apply_heard speaker=${ev.speaker} seq=${Number(ev?.seq ?? -1)} textLen=${heardText.length}`);
+	speechAgent.steer({
+		role: "user",
+		content: [{ type: "text", text: heardText }],
+		timestamp: Date.now(),
+	});
+	// Persist after steer state is actually reflected to avoid write-before-commit races.
+	persistSpeechConversationAfterSteer(heardText);
+}
+
 function scheduleSpeechWsReconnect() {
 	if (!speechWsActive || isClosing || speechWsReconnectTimer) return;
 	speechWsReconnectTimer = setTimeout(() => {
@@ -1293,11 +1340,7 @@ function flushDeferredSpeechEvents() {
 	while (pendingSpeechEvents.length > 0) {
 		const ev = pendingSpeechEvents.shift();
 		addSpeechLine(`[heard] ${ev.speaker}: ${ev.text}`);
-		speechAgent.steer({
-			role: "user",
-			content: [{ type: "text", text: `[${ev.speaker} says]: ${ev.text}` }],
-			timestamp: Date.now(),
-		});
+		applyHeardSpeechToConversation(ev);
 	}
 		if (!isSpeechPipelineBusy()) void runSpeechContinue("flushDeferredSpeechEvents");
 }
@@ -1305,6 +1348,7 @@ function flushDeferredSpeechEvents() {
 function handleSpeechEvent(ev) {
 	if (!ev || ev.type !== "speech") return;
 	const seq = Number(ev.seq);
+	debugLog(`[speech] ws_heard_event speaker=${ev?.speaker || ""} seq=${Number.isFinite(seq) ? seq : -1} textLen=${String(ev?.text || "").length}`);
 	if (Number.isFinite(seq) && seq > 0) {
 		if (seq <= speechLastSeq) return;
 		speechLastSeq = seq;
@@ -1324,11 +1368,7 @@ function handleSpeechEvent(ev) {
 	// Process heard speech immediately. Deferring on speaker lock caused stalls when
 	// observation-driven flush did not run, so replies could be blocked indefinitely.
 	addSpeechLine(`[heard] ${ev.speaker}: ${ev.text}`);
-	speechAgent.steer({
-		role: "user",
-		content: [{ type: "text", text: `[${ev.speaker} says]: ${ev.text}` }],
-		timestamp: Date.now(),
-	});
+	applyHeardSpeechToConversation(ev);
 	if (!isSpeechPipelineBusy()) void runSpeechContinue(`heard:${ev.speaker}`);
 }
 
